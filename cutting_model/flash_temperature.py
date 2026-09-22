@@ -24,6 +24,8 @@ class FlashResult:
     Pe: float
     iterations: int
     converged: bool
+    k: float  # thermal conductivity at convergence, W/(m*K)
+    cp: float  # specific heat at convergence, J/(kg*K)
 
 
 def _shape_coefficient(Pe: float) -> float:
@@ -61,6 +63,8 @@ def solve_flash_temperature(
     Pe = float("nan")
     T_flash = T_guess
     iteration = 0
+    k = material.k(T_guess)
+    cp = material.cp(T_guess)
 
     for iteration in range(1, max_iter + 1):
         k = material.k(T_guess)
@@ -86,4 +90,6 @@ def solve_flash_temperature(
 
         T_guess = (T_flash + T_guess) / 2.0
 
-    return FlashResult(T_flash=T_flash, Pe=Pe, iterations=iteration, converged=converged)
+    return FlashResult(
+        T_flash=T_flash, Pe=Pe, iterations=iteration, converged=converged, k=k, cp=cp
+    )
