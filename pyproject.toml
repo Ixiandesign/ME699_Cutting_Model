@@ -1,0 +1,18 @@
+[project]
+name = "cutting-model"
+version = "0.1.0"
+description = "Peclet-normalized cutting thermal model with 2D subsurface temperature and residual stress"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false

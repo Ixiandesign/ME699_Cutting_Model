@@ -27,10 +27,12 @@ updating live.
 
 ## Quick start
 
+Dependencies and the virtualenv are managed with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install -r requirements.txt
-python app.py       # interactive UI
-pytest               # test suite
+uv sync              # creates .venv, installs deps + uv.lock
+uv run python app.py # interactive UI
+uv run pytest        # test suite
 ```
 
 ## Physics summary
