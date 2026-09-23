@@ -19,20 +19,21 @@ thermal cycle at the flank (`x/b = 1`) is compared against each
 material's temperature-dependent yield strength to estimate a
 residual-stress-vs-depth profile.
 
-An interactive matplotlib desktop app (`app.py`) lets you vary material,
-cutting speed, force, and contact geometry and toggle between a **1D
+An interactive Streamlit web app (`app.py`) lets you vary material,
+cutting speed, force, and contact geometry and switch between a **1D
 view** (surface shape + actual temperature) and a **2D view**
 (subsurface temperature field + residual stress at the flank), all
-updating live.
+updating live in the browser. (Plots are rendered with matplotlib's
+non-interactive Agg backend, so no Tk/desktop GUI toolkit is required.)
 
 ## Quick start
 
 Dependencies and the virtualenv are managed with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync              # creates .venv, installs deps + uv.lock
-uv run python app.py # interactive UI
-uv run pytest        # test suite
+uv sync                       # creates .venv, installs deps + uv.lock
+uv run streamlit run app.py   # interactive UI (opens in your browser)
+uv run pytest                 # test suite
 ```
 
 ## Physics summary
@@ -143,6 +144,6 @@ cutting_model/
     subsurface.py             2D (x/b, z/b) subsurface temperature field
     residual_stress.py        thermoelastic-yield residual-stress model
     model.py                  ties the above together for the UI
-app.py                        interactive matplotlib UI (1D / 2D view toggle)
+app.py                        interactive Streamlit web UI (1D / 2D view tabs)
 tests/                        pytest suite (formula checks, bug regression, convergence)
 ```
