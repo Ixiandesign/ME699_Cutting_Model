@@ -15,8 +15,23 @@ Two views, picked via tabs:
   cutaway heatmap (z=0, the surface, at top), and the residual-stress-
   vs-depth profile at the flank/tool-exit location (x/b=1).
 
-Run with: uv run streamlit run app.py
+Run with: uv run python app.py (or uv run streamlit run app.py).
 """
+
+# An editor's Run button executes this file as plain Python. Hand that
+# invocation to Streamlit before making any UI calls. Streamlit executes
+# the file again with a ScriptRunContext, so this does not launch recursively.
+if __name__ == "__main__":
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+    if get_script_run_ctx(suppress_warning=True) is None:
+        import sys
+        from pathlib import Path
+
+        from streamlit.web import cli
+
+        sys.argv = ["streamlit", "run", str(Path(__file__).resolve()), *sys.argv[1:]]
+        raise SystemExit(cli.main())
 
 import matplotlib
 
@@ -62,9 +77,6 @@ SLIDER_SPECS = [
     ("w_mm", "Width of cut w (mm)", 1.0, 10.0),
 ]
 
-st.set_page_config(page_title="Cutting Thermal Model", layout="wide")
-
-
 def _style_axes(ax, title, ylabel):
     ax.set_facecolor(SURFACE)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc="left")
@@ -107,9 +119,9 @@ def _init_state():
 
 
 def _build_sidebar():
-    st.sidebar.subheader("Submission examples")
-    st.sidebar.button("A · Ti64 baseline (50 N)", on_click=_load_example, args=(50.0,))
-    st.sidebar.button("B · Ti64 tensile stress (200 N)", on_click=_load_example, args=(200.0,))
+    st.sidebar.subheader("Presets")
+    st.sidebar.button("Ti64 · 50 N", on_click=_load_example, args=(50.0,))
+    st.sidebar.button("Ti64 · 200 N", on_click=_load_example, args=(200.0,))
     st.sidebar.radio(
         "Material", MATERIAL_NAMES, key="material", on_change=_apply_material_defaults
     )
@@ -303,6 +315,7 @@ def _draw_2d(result2d, Pe):
 
 
 def main():
+    st.set_page_config(page_title="Cutting Thermal Model", layout="wide")
     _init_state()
     _build_sidebar()
 
@@ -317,27 +330,18 @@ def main():
     )
     result = model.solve()
 
-    force_note = (
-        f"Fc = {Fc_N:.1f} N (from feed h={st.session_state['h_mm']:.3f} mm via Kienzle fit)"
-        if st.session_state["use_kienzle"] and material is TI64
-        else f"Fc = {Fc_N:.1f} N (direct input)"
-    )
-    if st.session_state["use_kienzle"] and material is not TI64:
-        force_note += "  [Kienzle fit only available for Ti-6Al-4V; using direct Fc]"
-
-    st.title("Peclet-Normalized Cutting Thermal Model")
+    st.title("Cutting Thermal Model")
     st.caption(
-        f"{material.name} | {force_note} | v = {model.v_m_min:g} m/min | "
+        f"{material.name} | Fc = {Fc_N:.1f} N | v = {model.v_m_min:g} m/min | "
         f"b = {model.b_um:g} µm | w = {model.w_mm:g} mm | T₀ = 20 °C"
     )
     if not result.converged:
-        st.error("Flash-temperature iteration did not converge. Do not use this case as a submission example.")
+        st.error("Solver: not converged")
 
-    tab_submission, tab_1d, tab_2d = st.tabs(["Assignment overview", "1D view", "2D view"])
+    tab_overview, tab_1d, tab_2d = st.tabs(["Overview", "1D view", "2D view"])
     result2d = model.solve_2d(x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
 
-    with tab_submission:
-        st.subheader("1 · Flash temperature")
+    with tab_overview:
         metrics = st.columns(4)
         metrics[0].metric("Peak surface temperature", f"{20 + result.T_flash:.1f} °C")
         metrics[1].metric("Flash temperature rise ΔT", f"{result.T_flash:.1f} K")
@@ -346,17 +350,17 @@ def main():
         flash = solve_flash_temperature(material, model.v_m_min / 60, Fc_N,
                                         model.w_mm / 1000, model.b_um * 1e-6)
         st.caption(
-            f"Material-library inputs: ρ = {material.rho:g} kg/m³; "
+            f"ρ = {material.rho:g} kg/m³; "
             f"k = {flash.k:.2f} W/(m·K); cp = {flash.cp:.2f} J/(kg·K) "
-            f"at the final iteration. Solver: {'converged' if flash.converged else 'NOT converged'} "
-            f"in {flash.iterations} iterations. Contact spans −1 ≤ x/b ≤ 1."
+            f"| Solver: {'converged' if flash.converged else 'NOT converged'} "
+            f"| Iterations = {flash.iterations}"
         )
         columns = st.columns(3)
         norm, surface = _draw_1d(result)
         plt.close(norm)
         field, stress = _draw_2d(result2d, result2d.Pe)
         for column, title, fig in zip(columns,
-                ["2 · 1D surface profile", "3 · 2D subsurface field", "4 · Residual stress estimate"],
+                ["Surface temperature", "Subsurface temperature", "Residual stress"],
                 [surface, field, stress]):
             column.markdown(f"**{title}**")
             fig.tight_layout()
@@ -365,31 +369,13 @@ def main():
         # Report an actual subsurface sample, separately from the surface maximum.
         depth_idx = 1
         st.caption(
-            f"Stress section: x/b = {result2d.flank_x_over_b:.3f} (nearest grid point to 1). "
-            f"At z/b = {result2d.z_over_b[depth_idx]:.3f} "
+            f"x/b = {result2d.flank_x_over_b:.3f} | "
+            f"z/b = {result2d.z_over_b[depth_idx]:.3f} "
             f"(z = {result2d.z_over_b[depth_idx] * model.b_um:.2f} µm): "
             f"T = {result2d.T_flank_profile_C[depth_idx]:.1f} °C, "
             f"σres = {result2d.residual_stress_MPa[depth_idx]:.1f} MPa. "
-            "Positive stress is tensile; zero means the thermal-yield threshold was not exceeded."
+            "Tensile +"
         )
-        if material is not TI64:
-            st.warning("Use Ti-6Al-4V for the graduate requirement. Other alloys' inherited stress fits can give nonphysical negative values; AA6061 also reuses AA7050 thermal properties.")
-        st.markdown("**Model narrative and limitations**")
-        st.write(
-            "This calculator takes cutting force, speed, contact half-width, width of cut, and material "
-            "properties as inputs. It iterates a Peclet-based flash-temperature correlation, then scales "
-            "a normalized moving-band-source surface profile by the temperature rise and adds the "
-            "20 °C ambient temperature. A transient-conduction depth attenuation, using exposure time "
-            "2b/v, produces the approximate 2D temperature field. At x/b ≈ 1, a thermoelastic stress "
-            "comparison with temperature-dependent yield strength sets a threshold; for Ti-6Al-4V, "
-            "the course-reference fit σres = 2.8788T − 1365.2 MPa is used above that threshold and "
-            "zero below it. This is an empirical thermal-only stress estimate, not a full mechanical "
-            "cutting simulation. Limitations include the separable depth approximation, fixed effective "
-            "diffusivity, property-fit extrapolation, and inherited reference conventions: properties "
-            "are evaluated at the flash-rise iterate and depth attenuation acts on total Celsius "
-            "temperature before clipping at ambient. Contact half-width and force can be entered directly."
-        )
-        st.caption("Screenshot guide: load A for the baseline, then B for nonzero tensile stress. Capture this overview; use the 1D and 2D tabs for larger plots. Examples are illustrative predictions, not experimental validation.")
 
     with tab_1d:
         fig_norm, fig_actual = _draw_1d(result)
@@ -398,21 +384,12 @@ def main():
         col2.pyplot(fig_actual, clear_figure=True)
 
     with tab_2d:
-        if np.isfinite(result2d.T_critical_C):
-            yielded = np.any(result2d.T_flank_profile_C > result2d.T_critical_C)
-            if yielded:
-                st.caption(
-                    f"T_critical = {result2d.T_critical_C:.0f}°C   |   "
-                    f"residual stress at flank: {result2d.residual_stress_MPa.min():.0f} to "
-                    f"{result2d.residual_stress_MPa.max():.0f} MPa"
-                )
-            else:
-                st.caption(
-                    f"T_critical = {result2d.T_critical_C:.0f}°C   |   "
-                    "temperatures at the sampled flank stay below it — no thermal residual stress"
-                )
-        else:
-            st.caption(f"{material.name} never reaches its thermal-yield critical temperature")
+        st.caption(
+            f"T_critical = {result2d.T_critical_C:.1f} °C | "
+            f"σres = {result2d.residual_stress_MPa.min():.1f} to "
+            f"{result2d.residual_stress_MPa.max():.1f} MPa | "
+            f"x/b = {result2d.flank_x_over_b:.3f}"
+        )
 
         fig_field, fig_rs = _draw_2d(result2d, result2d.Pe)
         col1, col2 = st.columns(2)
