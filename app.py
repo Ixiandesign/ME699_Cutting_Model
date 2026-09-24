@@ -28,6 +28,7 @@ import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 
 from cutting_model.forces import estimate_cutting_force
+from cutting_model.flash_temperature import solve_flash_temperature
 from cutting_model.materials import AA6061, AA7050, DEFAULTS, SS304, TI64
 from cutting_model.model import CuttingThermalModel
 
@@ -106,6 +107,9 @@ def _init_state():
 
 
 def _build_sidebar():
+    st.sidebar.subheader("Submission examples")
+    st.sidebar.button("A · Ti64 baseline (50 N)", on_click=_load_example, args=(50.0,))
+    st.sidebar.button("B · Ti64 tensile stress (200 N)", on_click=_load_example, args=(200.0,))
     st.sidebar.radio(
         "Material", MATERIAL_NAMES, key="material", on_change=_apply_material_defaults
     )
@@ -119,6 +123,13 @@ def _build_sidebar():
     )
 
 
+def _load_example(force):
+    st.session_state["material"] = TI64.name
+    _apply_material_defaults()
+    st.session_state["Fc_N"] = force
+    st.session_state["use_kienzle"] = False
+
+
 def _effective_force(material):
     if st.session_state["use_kienzle"] and material is TI64:
         return estimate_cutting_force(material, st.session_state["h_mm"], st.session_state["w_mm"])
@@ -127,7 +138,9 @@ def _effective_force(material):
 
 def _draw_1d(result):
     fig_norm, ax_norm = _new_figure()
-    _style_axes(ax_norm, "Normalized surface shape (peak = 1)", "T / T_peak")
+    _style_axes(
+        ax_norm, f"Normalized surface shape (peak = 1, Pe = {result.Pe:.2f})", "(T − T₀) / ΔT_flash"
+    )
     ax_norm.set_xlabel("x / b", color=INK_SECONDARY)
     ax_norm.plot(result.x_over_b, result.shape, color=SERIES_NORM, linewidth=2)
     ax_norm.plot(
@@ -181,13 +194,56 @@ def _draw_1d(result):
     return fig_norm, fig_actual
 
 
-def _draw_2d(result2d):
+def _significant_extent(result2d, frac=0.02, x_pad=0.3, z_pad=1.3, x_min_width=1.0, z_min=0.15):
+    """Bounding box around the part of the temperature field that's
+    actually above ambient, so the plotted axes crop to where the
+    gradient lives instead of mostly-white far-field space. `frac` is
+    the fraction of the peak temperature rise used as the "still
+    visible" cutoff. Falls back to the full grid if nothing clears it
+    (e.g. the flash temperature barely exceeds ambient)."""
+    T_ambient = float(result2d.T_field_C.min())
+    rise = result2d.T_field_C - T_ambient
+    peak_rise = rise.max()
+    if peak_rise <= 0:
+        return result2d.x_over_b.min(), result2d.x_over_b.max(), result2d.z_over_b.max()
+
+    threshold = frac * peak_rise
+    z_mask = np.any(rise > threshold, axis=1)
+    x_mask = np.any(rise > threshold, axis=0)
+    if not z_mask.any() or not x_mask.any():
+        return result2d.x_over_b.min(), result2d.x_over_b.max(), result2d.z_over_b.max()
+
+    z_hi = max(result2d.z_over_b[z_mask].max() * z_pad, z_min)
+    z_hi = min(z_hi, result2d.z_over_b.max())
+
+    x_lo, x_hi = result2d.x_over_b[x_mask].min(), result2d.x_over_b[x_mask].max()
+    width = x_hi - x_lo
+    pad = max(width * x_pad, (x_min_width - width) / 2, 0.0)
+    x_lo = max(x_lo - pad, result2d.x_over_b.min())
+    x_hi = min(x_hi + pad, result2d.x_over_b.max())
+
+    return x_lo, x_hi, z_hi
+
+
+def _draw_2d(result2d, Pe):
+    x_lo, x_hi, z_hi = _significant_extent(result2d)
+
+    T_crit = result2d.T_critical_C
+    yielded = np.isfinite(T_crit) and np.any(result2d.T_flank_profile_C > T_crit)
+    if yielded:
+        # Guarantee the yielded-depth marker below is never cropped out,
+        # even in the rare case it reaches slightly past the field's own
+        # "significant gradient" cutoff.
+        yield_depth = result2d.z_over_b[result2d.T_flank_profile_C > T_crit].max()
+        z_hi = max(z_hi, yield_depth * 1.15)
+
     fig_field, ax_field = _new_figure()
     _style_axes(
-        ax_field, "Subsurface temperature field (flank cutaway)", "z / b (depth)"
+        ax_field,
+        f"Subsurface temperature field (flank cutaway, Pe = {Pe:.2f})",
+        "z / b (depth)",
     )
     ax_field.set_xlabel("x / b", color=INK_SECONDARY)
-    ax_field.invert_yaxis()  # surface (z=0) at top, like a cutaway
     mesh = ax_field.pcolormesh(
         result2d.x_over_b,
         result2d.z_over_b,
@@ -200,7 +256,6 @@ def _draw_2d(result2d):
     colorbar.set_label("Temperature (°C)", color=INK_SECONDARY)
     colorbar.outline.set_visible(False)
 
-    T_crit = result2d.T_critical_C
     field_max = result2d.T_field_C.max()
     if np.isfinite(T_crit) and field_max > T_crit > result2d.T_field_C.min():
         ax_field.contour(
@@ -215,6 +270,8 @@ def _draw_2d(result2d):
     ax_field.axvline(
         result2d.flank_x_over_b, color=INK_PRIMARY, linewidth=1.0, linestyle=":"
     )
+    ax_field.set_xlim(x_lo, x_hi)
+    ax_field.set_ylim(z_hi, 0)  # surface (z=0) at top, like a cutaway; cropped to the gradient
 
     fig_rs, ax_rs = _new_figure()
     _style_axes(
@@ -224,19 +281,18 @@ def _draw_2d(result2d):
     ax_rs.axhline(0.0, color=AXIS_COLOR, linewidth=1.0)
     rs = result2d.residual_stress_MPa
     ax_rs.plot(result2d.z_over_b, rs, color=SERIES_ACTUAL, linewidth=2)
-    ax_rs.set_xlim(result2d.z_over_b.min(), result2d.z_over_b.max())
+    # Share the field plot's depth crop so both panels read at the same scale.
+    ax_rs.set_xlim(0.0, z_hi)
     rs_max = max(rs.max(), 0.0)
     rs_min = min(rs.min(), 0.0)
     pad = max(rs_max - rs_min, 1.0) * 0.15
     ax_rs.set_ylim(rs_min - pad, rs_max + pad)
 
-    if np.isfinite(T_crit) and np.any(result2d.T_flank_profile_C > T_crit):
-        affected = result2d.z_over_b[result2d.T_flank_profile_C > T_crit]
-        depth = affected.max()
-        ax_rs.axvline(depth, color=INK_MUTED, linewidth=1.0, linestyle="--")
+    if yielded:
+        ax_rs.axvline(yield_depth, color=INK_MUTED, linewidth=1.0, linestyle="--")
         ax_rs.annotate(
-            f"yielded to z/b={depth:.2f}",
-            xy=(depth, rs_max + pad * 0.5),
+            f"yielded to z/b={yield_depth:.2f}",
+            xy=(yield_depth, rs_max + pad * 0.5),
             xytext=(6, 6),
             textcoords="offset points",
             color=INK_MUTED,
@@ -270,14 +326,70 @@ def main():
         force_note += "  [Kienzle fit only available for Ti-6Al-4V; using direct Fc]"
 
     st.title("Peclet-Normalized Cutting Thermal Model")
-    st.markdown(
-        f"**{material.name}**   |   Pe = {result.Pe:.3f}   |   "
-        f"T_flash = {result.T_flash:.1f}°C"
-        + ("" if result.converged else "   :warning: **not converged**")
+    st.caption(
+        f"{material.name} | {force_note} | v = {model.v_m_min:g} m/min | "
+        f"b = {model.b_um:g} µm | w = {model.w_mm:g} mm | T₀ = 20 °C"
     )
-    st.caption(force_note)
+    if not result.converged:
+        st.error("Flash-temperature iteration did not converge. Do not use this case as a submission example.")
 
-    tab_1d, tab_2d = st.tabs(["1D view", "2D view"])
+    tab_submission, tab_1d, tab_2d = st.tabs(["Assignment overview", "1D view", "2D view"])
+    result2d = model.solve_2d(x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
+
+    with tab_submission:
+        st.subheader("1 · Flash temperature")
+        metrics = st.columns(4)
+        metrics[0].metric("Peak surface temperature", f"{20 + result.T_flash:.1f} °C")
+        metrics[1].metric("Flash temperature rise ΔT", f"{result.T_flash:.1f} K")
+        metrics[2].metric("Peclet number", f"{result.Pe:.3f}")
+        metrics[3].metric("Thermal-yield threshold", f"{result2d.T_critical_C:.1f} °C")
+        flash = solve_flash_temperature(material, model.v_m_min / 60, Fc_N,
+                                        model.w_mm / 1000, model.b_um * 1e-6)
+        st.caption(
+            f"Material-library inputs: ρ = {material.rho:g} kg/m³; "
+            f"k = {flash.k:.2f} W/(m·K); cp = {flash.cp:.2f} J/(kg·K) "
+            f"at the final iteration. Solver: {'converged' if flash.converged else 'NOT converged'} "
+            f"in {flash.iterations} iterations. Contact spans −1 ≤ x/b ≤ 1."
+        )
+        columns = st.columns(3)
+        norm, surface = _draw_1d(result)
+        plt.close(norm)
+        field, stress = _draw_2d(result2d, result2d.Pe)
+        for column, title, fig in zip(columns,
+                ["2 · 1D surface profile", "3 · 2D subsurface field", "4 · Residual stress estimate"],
+                [surface, field, stress]):
+            column.markdown(f"**{title}**")
+            fig.tight_layout()
+            column.pyplot(fig)
+            plt.close(fig)
+        # Report an actual subsurface sample, separately from the surface maximum.
+        depth_idx = 1
+        st.caption(
+            f"Stress section: x/b = {result2d.flank_x_over_b:.3f} (nearest grid point to 1). "
+            f"At z/b = {result2d.z_over_b[depth_idx]:.3f} "
+            f"(z = {result2d.z_over_b[depth_idx] * model.b_um:.2f} µm): "
+            f"T = {result2d.T_flank_profile_C[depth_idx]:.1f} °C, "
+            f"σres = {result2d.residual_stress_MPa[depth_idx]:.1f} MPa. "
+            "Positive stress is tensile; zero means the thermal-yield threshold was not exceeded."
+        )
+        if material is not TI64:
+            st.warning("Use Ti-6Al-4V for the graduate requirement. Other alloys' inherited stress fits can give nonphysical negative values; AA6061 also reuses AA7050 thermal properties.")
+        st.markdown("**Model narrative and limitations**")
+        st.write(
+            "This calculator takes cutting force, speed, contact half-width, width of cut, and material "
+            "properties as inputs. It iterates a Peclet-based flash-temperature correlation, then scales "
+            "a normalized moving-band-source surface profile by the temperature rise and adds the "
+            "20 °C ambient temperature. A transient-conduction depth attenuation, using exposure time "
+            "2b/v, produces the approximate 2D temperature field. At x/b ≈ 1, a thermoelastic stress "
+            "comparison with temperature-dependent yield strength sets a threshold; for Ti-6Al-4V, "
+            "the course-reference fit σres = 2.8788T − 1365.2 MPa is used above that threshold and "
+            "zero below it. This is an empirical thermal-only stress estimate, not a full mechanical "
+            "cutting simulation. Limitations include the separable depth approximation, fixed effective "
+            "diffusivity, property-fit extrapolation, and inherited reference conventions: properties "
+            "are evaluated at the flash-rise iterate and depth attenuation acts on total Celsius "
+            "temperature before clipping at ambient. Contact half-width and force can be entered directly."
+        )
+        st.caption("Screenshot guide: load A for the baseline, then B for nonzero tensile stress. Capture this overview; use the 1D and 2D tabs for larger plots. Examples are illustrative predictions, not experimental validation.")
 
     with tab_1d:
         fig_norm, fig_actual = _draw_1d(result)
@@ -286,7 +398,6 @@ def main():
         col2.pyplot(fig_actual, clear_figure=True)
 
     with tab_2d:
-        result2d = model.solve_2d(x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
         if np.isfinite(result2d.T_critical_C):
             yielded = np.any(result2d.T_flank_profile_C > result2d.T_critical_C)
             if yielded:
@@ -298,12 +409,12 @@ def main():
             else:
                 st.caption(
                     f"T_critical = {result2d.T_critical_C:.0f}°C   |   "
-                    "flash temperature stays below it -- no residual stress"
+                    "temperatures at the sampled flank stay below it — no thermal residual stress"
                 )
         else:
             st.caption(f"{material.name} never reaches its thermal-yield critical temperature")
 
-        fig_field, fig_rs = _draw_2d(result2d)
+        fig_field, fig_rs = _draw_2d(result2d, result2d.Pe)
         col1, col2 = st.columns(2)
         col1.pyplot(fig_field, clear_figure=True)
         col2.pyplot(fig_rs, clear_figure=True)
