@@ -48,13 +48,18 @@ def kienzle_force(h_mm, w_mm):
     return C * h_mm**n * h_mm * w_mm
 
 
+# Tool geometry and heat-source constants of the reference workbook's
+# 'Constants' block (slides: shear angle 35 deg + rake angle, l_ext = r/(2 tan a)).
+GEOMETRY = dict(rake_deg=0.0, clearance_deg=5.0, edge_radius_um=10.0)
+SHEAR_BASE_DEG = 35.0  # shear angle = 35 + rake angle (slides)
+
+# The workbook applies a factor 0.7 to the Kienzle force when it is used as the
+# heat-generating force (master sheet C12). Not in the slides.
+HEAT_FORCE_FRACTION = 0.7
+
 # Calibration factors multiplying the Pe<5 / Pe>5 flash-temperature correlations
-# (the workbook uses 0.95 / 0.90). The references give no values, so a_high is
-# fitted to the measured peak temperatures (calibrate_flash) and a_low follows
-# from continuity at Pe = 5. a_high is small because it also absorbs the
-# workbook's force factor 0.7, heat partition R and shear-plane b, which this
-# model replaces by the Kienzle force and a fixed b.
-CALIBRATION = dict(a_low=0.3479, a_high=0.3424)
+# (workbook cells C14, C15). calibrate_flash refits a_high to the measured data.
+CALIBRATION = dict(a_low=0.95, a_high=0.90)
 
 # Measured peak temperatures (deg C) at feed h = 0.05 mm, from the workbook.
 DATA_H = 0.05
@@ -62,20 +67,11 @@ DATA_V_M_MIN = (20.0, 40.0, 60.0, 80.0, 100.0)
 DATA_T_C = (360.0, 400.0, 430.0, 470.0, 490.0)
 
 
-def continuity_a_low(a_high):
-    """a_low making the two correlations agree at Pe = 5 (they differ by 1.6 %
-    uncalibrated, so a_low = 1.0163 a_high)."""
-    Pe = 5.0
-    low = 0.159 * (0.00527 * Pe**3 - 0.192 * Pe**2 + 2.39 * Pe)
-    high = 0.399 * (2.0 * Pe) ** 0.5  # 0.399 sqrt(2 Pe), same prefactors as low
-    return a_high * high / low
-
-
 def calibrate_flash(v_m_min=DATA_V_M_MIN, T_peak=DATA_T_C, h_mm=DATA_H, w_mm=3.0,
-                    b_um=200.0, T_ambient=20.0):
-    """Least-squares fit of a_high to measured peak temperatures; a_low then
-    follows from continuity (the data are all Pe > 5, so it cannot be fitted
-    from them). Returns dict(a_low, a_high, rms) with rms in deg C."""
+                    T_ambient=20.0):
+    """Least-squares fit of a_high to measured peak temperatures using the
+    shear-plane model (all data are Pe > 5, so a_low cannot be fitted from
+    them). Returns dict(a_high, rms) with rms in deg C."""
     from scipy.optimize import least_squares
     v = np.asarray(v_m_min, dtype=float) / 60.0
     T = np.asarray(T_peak, dtype=float)
@@ -83,19 +79,31 @@ def calibrate_flash(v_m_min=DATA_V_M_MIN, T_peak=DATA_T_C, h_mm=DATA_H, w_mm=3.0
 
     def resid(p):
         return np.array([T_ambient + flash_temperature(
-            x, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient, a_high=p[0]).T_flash
-            for x in v]) - T
+            x, Fc, w_mm / 1000.0, None, T_ambient, a_high=p[0],
+            h_m=h_mm / 1000.0).T_flash for x in v]) - T
 
-    r = least_squares(resid, [0.5])
-    a_high = float(r.x[0])
-    return dict(a_low=continuity_a_low(a_high), a_high=a_high,
-                rms=float(np.sqrt(np.mean(r.fun ** 2))))
+    r = least_squares(resid, [CALIBRATION["a_high"]])
+    return dict(a_high=float(r.x[0]), rms=float(np.sqrt(np.mean(r.fun ** 2))))
 
 
 # ================================================================ 1. flash T
 def peclet_number(v_m_s, rho, b_m, cp, k):
     """Pe = v*rho*b*cp / (2k). b = contact half-width."""
     return v_m_s * rho * b_m * cp / (2.0 * k)
+
+
+def shear_plane_contact(v_m_s, h_m, k, cp):
+    """Effective thermal contact from the shear-plane heat source (slides):
+    l_s = h/sin(phi), Pe_shear = v l_s rho cp / (4k), thermal layer
+    delta = l_s/sqrt(Pe_shear), l_int = delta/sin(phi), l_ext = r/(2 tan(alpha)),
+    b = (l_ext + l_int)/2 and heat partition R = min(1, 0.6 Pe_shear^-0.4).
+    Returns (b, R, Pe_shear) with b in m."""
+    phi = np.radians(SHEAR_BASE_DEG + GEOMETRY["rake_deg"])
+    l_s = h_m / np.sin(phi)
+    Pe_s = v_m_s * l_s * TI64["rho"] * cp / (4.0 * k)
+    l_int = l_s / np.sqrt(Pe_s) / np.sin(phi)
+    l_ext = GEOMETRY["edge_radius_um"] * 1e-6 / (2.0 * np.tan(np.radians(GEOMETRY["clearance_deg"])))
+    return (l_int + l_ext) / 2.0, min(1.0, 0.6 * Pe_s ** -0.4), Pe_s
 
 
 @dataclass(frozen=True)
@@ -107,48 +115,61 @@ class FlashResult:
     k: float   # conductivity at convergence, W/(m K)
     cp: float  # specific heat at convergence, J/(kg K)
     history: tuple = ()  # initial guess, then T_flash at each iteration
+    b: float = float("nan")  # contact half-width used, m
+    R: float = 1.0           # heat partition into the workpiece
 
 
-def flash_temperature(v_m_s, Fc_N, w_m, b_m, T_ambient=20.0, T_initial=None,
-                      max_iter=200, tol=1e-3, a_low=None, a_high=None):
+def flash_temperature(v_m_s, Fc_N, w_m, b_m=None, T_ambient=20.0, T_initial=None,
+                      max_iter=200, tol=1e-3, a_low=None, a_high=None, h_m=None):
     """Peak temperature rise by damped fixed-point iteration (k, cp depend on T).
 
     Follows Subsurface_thermal.m (x2 on Fc on both Pe branches; the Excel
-    workbooks omit it on the high-Pe branch, a discrepancy in the references).
-    Adds an iteration cap (the script has none; extreme speeds can diverge)
-    and a numeric tolerance instead of integer rounding. The initial guess
-    defaults to halfway between ambient and the melting point.
+    workbooks omit it on the high-Pe branch of the first pass only). Adds an
+    iteration cap (the script has none; extreme speeds can diverge) and a
+    numeric tolerance instead of integer rounding. The initial guess defaults
+    to halfway between ambient and the melting point.
 
-    a_low / a_high are the workbook's calibration factors multiplying the
-    Pe < 5 and Pe > 5 correlations (default CALIBRATION; see calibrate_flash).
+    b_m given: contact half-width b is fixed, all of Fc_N is heat (R = 1).
+    b_m None: machining mode (needs feed h_m, in m). b and the heat partition R
+    come from the shear-plane model at the current k, cp (shear_plane_contact)
+    and only HEAT_FORCE_FRACTION of Fc_N is heat, as in the workbook's master
+    sheet. a_low / a_high multiply the Pe < 5 / Pe > 5 correlations.
     """
     a_low = CALIBRATION["a_low"] if a_low is None else a_low
     a_high = CALIBRATION["a_high"] if a_high is None else a_high
+    machining = b_m is None
+    if machining and h_m is None:
+        raise ValueError("flash_temperature needs b_m or the feed h_m")
+    heat_N = HEAT_FORCE_FRACTION * Fc_N if machining else Fc_N
     m = TI64
     rho = m["rho"]
     T_guess = (T_ambient + m["T_melt"]) / 2.0 if T_initial is None else T_initial
     converged = False
     Pe, T_flash = float("nan"), T_guess
     k, cp = m["k"](T_guess), m["cp"](T_guess)
+    b, R = b_m, 1.0
     iteration = 0
     history = [float(T_guess)]  # initial guess, then T_flash per iteration
 
     for iteration in range(1, max_iter + 1):
         k, cp = m["k"](T_guess), m["cp"](T_guess)
-        Pe = peclet_number(v_m_s, rho, b_m, cp, k)
+        if machining:
+            b, R, _ = shear_plane_contact(v_m_s, h_m, k, cp)
+        Pe = peclet_number(v_m_s, rho, b, cp, k)
         if Pe < 5:
             C4 = 0.00527 * Pe**3 - 0.192 * Pe**2 + 2.39 * Pe
-            T_flash = a_low * 0.159 * C4 * (2.0 * Fc_N) / (rho * cp * w_m * b_m)
+            T_flash = a_low * 0.159 * C4 * (2.0 * heat_N * R) / (rho * cp * w_m * b)
         else:
-            T_flash = (a_high * 0.399 * (2.0 * Fc_N * v_m_s) / (k * w_m)
-                       * (k / (rho * cp * v_m_s * b_m)) ** 0.5)
+            T_flash = (a_high * 0.399 * (2.0 * heat_N * R * v_m_s) / (k * w_m)
+                       * (k / (rho * cp * v_m_s * b)) ** 0.5)
         history.append(float(T_flash))
         if abs(T_flash - T_guess) < tol:
             converged = True
             break
         T_guess = (T_flash + T_guess) / 2.0
 
-    return FlashResult(T_flash, Pe, iteration, converged, k, cp, tuple(history))
+    return FlashResult(T_flash, Pe, iteration, converged, k, cp, tuple(history),
+                       float(b), float(R))
 
 
 # ============================================================ 2. surface shape
@@ -165,6 +186,11 @@ def normalized_shape(x_over_b, Pe):
     comparison that is never true); this uses the correct three-branch form.
     """
     x = np.asarray(x_over_b, dtype=float)
+    # x/b = +-1 are removable singularities ((1 -+ x) * K1(0)); evaluating them
+    # exactly drops the limit and leaves a spike, so step just off each point
+    # (the workbook samples x/b = 0.999 and -2.001 for the same reason).
+    x = np.where(np.abs(x - 1.0) < 1e-6, 1.0 + 1e-6, x)
+    x = np.where(np.abs(x + 1.0) < 1e-6, -1.0 + 1e-6, x)
     Pp = _safe(Pe * (x + 1.0) / 2.0)
     Pm = _safe(Pe * (x - 1.0) / 2.0)
 
@@ -250,6 +276,8 @@ class ProfileResult:
     k: float
     cp: float
     history: tuple  # initial guess, then T_flash at each iteration
+    b_um: float = float("nan")  # contact half-width used, um
+    R: float = 1.0  # heat partition into the workpiece
 
 
 @dataclass(frozen=True)
@@ -264,46 +292,53 @@ class TwoDResult:
     Pe: float
     T_flash: float
     converged: bool
+    b_um: float = float("nan")  # contact half-width used, um
+    R: float = 1.0  # heat partition into the workpiece
 
 
-def _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient):
+def _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm=None):
+    """b_um None: derive b and the heat partition from the shear-plane model
+    (needs the feed h_mm); otherwise b is fixed and all of Fc_N is heat."""
     return flash_temperature(v_m_min / 60.0, Fc_N, w_mm / 1000.0,
-                             b_um * 1e-6, T_ambient)
+                             None if b_um is None else b_um * 1e-6, T_ambient,
+                             h_m=None if h_mm is None else h_mm / 1000.0)
 
 
-def solve(v_m_min, Fc_N, w_mm, b_um, T_ambient=20.0, x_over_b=None):
+def solve(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0, x_over_b=None, h_mm=None):
     """Flash temperature plus normalized and actual surface profiles."""
     x = DEFAULT_X_OVER_B if x_over_b is None else np.asarray(x_over_b, dtype=float)
-    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient)
+    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm)
     shape = normalized_shape(x, f.Pe)
     return ProfileResult(x, shape, T_ambient + f.T_flash * shape, f.Pe, f.T_flash,
                          float(x[np.argmax(shape)]), f.converged, f.iterations,
-                         f.k, f.cp, f.history)
+                         f.k, f.cp, f.history, f.b * 1e6, f.R)
 
 
-def solve_2d(v_m_min, Fc_N, w_mm, b_um, T_ambient=20.0,
-             x_over_b=None, z_over_b=None, flank_x_over_b=1.0):
+def solve_2d(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0,
+             x_over_b=None, z_over_b=None, flank_x_over_b=1.0, h_mm=None):
     """Subsurface field plus residual stress vs depth at the flank/tool-exit
     column (x/b = flank_x_over_b, default 1.0)."""
     x = DEFAULT_X_OVER_B if x_over_b is None else np.asarray(x_over_b, dtype=float)
     z = DEFAULT_Z_OVER_B if z_over_b is None else np.asarray(z_over_b, dtype=float)
-    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient)
+    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm)
 
     field = subsurface_temperature(x, z, f.Pe, f.T_flash, T_ambient, f.k, f.cp,
-                                   TI64["rho"], v_m_min / 60.0,
-                                   b_um * 1e-6)
+                                   TI64["rho"], v_m_min / 60.0, f.b)
     flank_idx = int(np.argmin(np.abs(x - flank_x_over_b)))
     T_flank = field[:, flank_idx]
     T_crit = critical_temperature(T_ambient)
     return TwoDResult(x, z, field, T_flank, residual_stress(T_flank, T_crit),
-                      T_crit, float(x[flank_idx]), f.Pe, f.T_flash, f.converged)
+                      T_crit, float(x[flank_idx]), f.Pe, f.T_flash, f.converged,
+                      f.b * 1e6, f.R)
 
 
 # ============================================== machining sweeps (assignment)
 # Force, flash temperature and critical speed vs feed h (uncut chip thickness)
-# and cutting speed v (m/s). Force comes from the Kienzle fit. Contact half-width b and width of cut w are held fixed.
+# and cutting speed v (m/s). Force comes from the Kienzle fit. Contact half-width
+# b and heat partition R come from the shear-plane model when b_um is None
+# (default); a number fixes b instead.
 _FLANK_X = np.linspace(-3.0, 5.0, 801)  # contains x/b = 1.0 exactly
-_FLANK_IDX = 500
+_FLANK_IDX = int(np.argmin(np.abs(_FLANK_X - 1.0)))
 
 
 def force_vs_feed(h_mm, w_mm=3.0):
@@ -313,17 +348,19 @@ def force_vs_feed(h_mm, w_mm=3.0):
 
 def _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient):
     Fc = float(kienzle_force(h_mm, w_mm))
-    return [flash_temperature(v, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient)
+    return [flash_temperature(v, Fc, w_mm / 1000.0,
+                              None if b_um is None else b_um * 1e-6, T_ambient,
+                              h_m=h_mm / 1000.0)
             for v in np.atleast_1d(v_m_s)]
 
 
-def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0):
+def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0):
     """Peak surface temperature (deg C) for each cutting speed (m/s) at feed h."""
     return np.array([T_ambient + f.T_flash
                      for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
 
 
-def pe_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0):
+def pe_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0):
     """Peclet number at convergence for each cutting speed (m/s) at feed h."""
     return np.array([f.Pe for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
 
@@ -332,11 +369,13 @@ def _flank_surface_temperature(v_m_s, h_mm, w_mm, b_um, T_ambient):
     """Surface temperature at the flank/tool-exit point x/b = 1, the location
     where residual stress is evaluated."""
     Fc = float(kienzle_force(h_mm, w_mm))
-    f = flash_temperature(v_m_s, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient)
+    f = flash_temperature(v_m_s, Fc, w_mm / 1000.0,
+                          None if b_um is None else b_um * 1e-6, T_ambient,
+                          h_m=h_mm / 1000.0)
     return T_ambient + f.T_flash * normalized_shape(_FLANK_X, f.Pe)[_FLANK_IDX]
 
 
-def critical_speed(h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0,
+def critical_speed(h_mm, w_mm=3.0, b_um=None, T_ambient=20.0,
                    v_min=0.01, v_max=10.0):
     """Lowest cutting speed (m/s) at which the flank surface temperature
     exceeds the critical temperature (thermal yielding, hence surface
