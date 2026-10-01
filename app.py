@@ -42,10 +42,7 @@ import numpy as np
 import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 
-from cutting_model.forces import estimate_cutting_force
-from cutting_model.flash_temperature import solve_flash_temperature
-from cutting_model.materials import AA6061, AA7050, DEFAULTS, SS304, TI64
-from cutting_model.model import CuttingThermalModel
+from model import MATERIALS, kienzle_force, solve, solve_2d
 
 # --- Palette (dataviz skill reference instance, light mode) -----------------
 SURFACE = "#fcfcfb"
@@ -63,9 +60,8 @@ TEMP_CMAP = LinearSegmentedColormap.from_list(
     "cutting_temp", [SURFACE, SERIES_ACTUAL, "#7a2e0e"]
 )
 
-MATERIAL_ORDER = [TI64, AA7050, SS304, AA6061]
-MATERIAL_NAMES = [m.name for m in MATERIAL_ORDER]
-MATERIAL_BY_NAME = {m.name: m for m in MATERIAL_ORDER}
+TI64 = "Ti-6Al-4V"
+MATERIAL_NAMES = list(MATERIALS)
 
 APP_X_OVER_B = np.linspace(-3.0, 5.0, 300)
 APP_Z_OVER_B = np.linspace(0.0, 4.0, 150)
@@ -98,7 +94,7 @@ def _new_figure():
 def _apply_material_defaults():
     """on_change callback for the material radio: reset the process
     sliders to that material's defaults before the widgets re-render."""
-    defaults = DEFAULTS[st.session_state["material"]]
+    defaults = MATERIALS[st.session_state["material"]]["defaults"]
     st.session_state["v_m_min"] = defaults["v_m_min"]
     st.session_state["Fc_N"] = defaults["Fc_N"]
     st.session_state["b_um"] = defaults["b_um"]
@@ -108,8 +104,8 @@ def _apply_material_defaults():
 def _init_state():
     if "material" in st.session_state:
         return
-    st.session_state["material"] = TI64.name
-    defaults = DEFAULTS[TI64.name]
+    st.session_state["material"] = TI64
+    defaults = MATERIALS[TI64]["defaults"]
     st.session_state["v_m_min"] = defaults["v_m_min"]
     st.session_state["Fc_N"] = defaults["Fc_N"]
     st.session_state["b_um"] = defaults["b_um"]
@@ -136,15 +132,15 @@ def _build_sidebar():
 
 
 def _load_example(force):
-    st.session_state["material"] = TI64.name
+    st.session_state["material"] = TI64
     _apply_material_defaults()
     st.session_state["Fc_N"] = force
     st.session_state["use_kienzle"] = False
 
 
 def _effective_force(material):
-    if st.session_state["use_kienzle"] and material is TI64:
-        return estimate_cutting_force(material, st.session_state["h_mm"], st.session_state["w_mm"])
+    if st.session_state["use_kienzle"] and material == TI64:
+        return kienzle_force(st.session_state["h_mm"], st.session_state["w_mm"])
     return st.session_state["Fc_N"]
 
 
@@ -319,27 +315,21 @@ def main():
     _init_state()
     _build_sidebar()
 
-    material = MATERIAL_BY_NAME[st.session_state["material"]]
+    material = st.session_state["material"]
     Fc_N = _effective_force(material)
-    model = CuttingThermalModel(
-        material=material,
-        v_m_min=st.session_state["v_m_min"],
-        Fc_N=Fc_N,
-        w_mm=st.session_state["w_mm"],
-        b_um=st.session_state["b_um"],
-    )
-    result = model.solve()
+    v, w, b = (st.session_state[k] for k in ("v_m_min", "w_mm", "b_um"))
+    result = solve(material, v, Fc_N, w, b)
 
     st.title("Cutting Thermal Model")
     st.caption(
-        f"{material.name} | Fc = {Fc_N:.1f} N | v = {model.v_m_min:g} m/min | "
-        f"b = {model.b_um:g} µm | w = {model.w_mm:g} mm | T₀ = 20 °C"
+        f"{material} | Fc = {Fc_N:.1f} N | v = {v:g} m/min | "
+        f"b = {b:g} µm | w = {w:g} mm | T₀ = 20 °C"
     )
     if not result.converged:
         st.error("Solver: not converged")
 
     tab_overview, tab_1d, tab_2d = st.tabs(["Overview", "1D view", "2D view"])
-    result2d = model.solve_2d(x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
+    result2d = solve_2d(material, v, Fc_N, w, b, x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
 
     with tab_overview:
         metrics = st.columns(4)
@@ -347,13 +337,11 @@ def main():
         metrics[1].metric("Flash temperature rise ΔT", f"{result.T_flash:.1f} K")
         metrics[2].metric("Peclet number", f"{result.Pe:.3f}")
         metrics[3].metric("Thermal-yield threshold", f"{result2d.T_critical_C:.1f} °C")
-        flash = solve_flash_temperature(material, model.v_m_min / 60, Fc_N,
-                                        model.w_mm / 1000, model.b_um * 1e-6)
         st.caption(
-            f"ρ = {material.rho:g} kg/m³; "
-            f"k = {flash.k:.2f} W/(m·K); cp = {flash.cp:.2f} J/(kg·K) "
-            f"| Solver: {'converged' if flash.converged else 'NOT converged'} "
-            f"| Iterations = {flash.iterations}"
+            f"ρ = {MATERIALS[material]['rho']:g} kg/m³; "
+            f"k = {result.k:.2f} W/(m·K); cp = {result.cp:.2f} J/(kg·K) "
+            f"| Solver: {'converged' if result.converged else 'NOT converged'} "
+            f"| Iterations = {result.iterations}"
         )
         columns = st.columns(3)
         norm, surface = _draw_1d(result)
@@ -371,7 +359,7 @@ def main():
         st.caption(
             f"x/b = {result2d.flank_x_over_b:.3f} | "
             f"z/b = {result2d.z_over_b[depth_idx]:.3f} "
-            f"(z = {result2d.z_over_b[depth_idx] * model.b_um:.2f} µm): "
+            f"(z = {result2d.z_over_b[depth_idx] * b:.2f} µm): "
             f"T = {result2d.T_flank_profile_C[depth_idx]:.1f} °C, "
             f"σres = {result2d.residual_stress_MPa[depth_idx]:.1f} MPa. "
             "Tensile +"
