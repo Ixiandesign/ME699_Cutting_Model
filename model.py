@@ -59,7 +59,18 @@ HEAT_FORCE_FRACTION = 0.7
 
 # Calibration factors multiplying the Pe<5 / Pe>5 flash-temperature correlations
 # (workbook cells C14, C15). calibrate_flash refits a_high to the measured data.
+# Only valid in machining mode (b_m=None): it assumes the shear-plane R and the
+# 0.7 heat-force fraction are already applied.
 CALIBRATION = dict(a_low=0.95, a_high=0.90)
+
+# Calibration for a fixed contact half-width (b_m given explicitly): the
+# reference workbook's Ti64 tab (its worked flash-temperature example, cells
+# I9/J9) applies the 0.159 / 0.399 correlations raw, with no multiplier and no
+# shear-plane R or 0.7 heat-force fraction (R=1, full Fc is heat). This mode
+# is a direct port of that tab, so it is uncalibrated by construction; it is
+# not fit to the measured machining data and will not track it as closely as
+# CALIBRATION (machining mode) does.
+CALIBRATION_FIXED_B = dict(a_low=1.0, a_high=1.0)
 
 # Measured peak temperatures (deg C) at feed h = 0.05 mm, from the workbook.
 DATA_H = 0.05
@@ -296,18 +307,22 @@ class TwoDResult:
     R: float = 1.0  # heat partition into the workpiece
 
 
-def _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm=None):
+def _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm=None, a_low=None, a_high=None):
     """b_um None: derive b and the heat partition from the shear-plane model
-    (needs the feed h_mm); otherwise b is fixed and all of Fc_N is heat."""
+    (needs the feed h_mm); otherwise b is fixed and all of Fc_N is heat.
+    a_low/a_high override CALIBRATION (use CALIBRATION_FIXED_B when b_um is
+    fixed, since the default CALIBRATION assumes the shear-plane R)."""
     return flash_temperature(v_m_min / 60.0, Fc_N, w_mm / 1000.0,
                              None if b_um is None else b_um * 1e-6, T_ambient,
-                             h_m=None if h_mm is None else h_mm / 1000.0)
+                             h_m=None if h_mm is None else h_mm / 1000.0,
+                             a_low=a_low, a_high=a_high)
 
 
-def solve(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0, x_over_b=None, h_mm=None):
+def solve(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0, x_over_b=None, h_mm=None,
+         a_low=None, a_high=None):
     """Flash temperature plus normalized and actual surface profiles."""
     x = DEFAULT_X_OVER_B if x_over_b is None else np.asarray(x_over_b, dtype=float)
-    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm)
+    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm, a_low, a_high)
     shape = normalized_shape(x, f.Pe)
     return ProfileResult(x, shape, T_ambient + f.T_flash * shape, f.Pe, f.T_flash,
                          float(x[np.argmax(shape)]), f.converged, f.iterations,
@@ -315,12 +330,13 @@ def solve(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0, x_over_b=None, h_mm=No
 
 
 def solve_2d(v_m_min, Fc_N, w_mm, b_um=None, T_ambient=20.0,
-             x_over_b=None, z_over_b=None, flank_x_over_b=1.0, h_mm=None):
+             x_over_b=None, z_over_b=None, flank_x_over_b=1.0, h_mm=None,
+             a_low=None, a_high=None):
     """Subsurface field plus residual stress vs depth at the flank/tool-exit
     column (x/b = flank_x_over_b, default 1.0)."""
     x = DEFAULT_X_OVER_B if x_over_b is None else np.asarray(x_over_b, dtype=float)
     z = DEFAULT_Z_OVER_B if z_over_b is None else np.asarray(z_over_b, dtype=float)
-    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm)
+    f = _flash(v_m_min, Fc_N, w_mm, b_um, T_ambient, h_mm, a_low, a_high)
 
     field = subsurface_temperature(x, z, f.Pe, f.T_flash, T_ambient, f.k, f.cp,
                                    TI64["rho"], v_m_min / 60.0, f.b)
@@ -346,43 +362,43 @@ def force_vs_feed(h_mm, w_mm=3.0):
     return kienzle_force(np.asarray(h_mm, dtype=float), w_mm)
 
 
-def _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient):
+def _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient, a_low=None, a_high=None):
     Fc = float(kienzle_force(h_mm, w_mm))
     return [flash_temperature(v, Fc, w_mm / 1000.0,
                               None if b_um is None else b_um * 1e-6, T_ambient,
-                              h_m=h_mm / 1000.0)
+                              h_m=h_mm / 1000.0, a_low=a_low, a_high=a_high)
             for v in np.atleast_1d(v_m_s)]
 
 
-def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0):
+def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0, a_low=None, a_high=None):
     """Peak surface temperature (deg C) for each cutting speed (m/s) at feed h."""
     return np.array([T_ambient + f.T_flash
-                     for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
+                     for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient, a_low, a_high)])
 
 
-def pe_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0):
+def pe_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=None, T_ambient=20.0, a_low=None, a_high=None):
     """Peclet number at convergence for each cutting speed (m/s) at feed h."""
-    return np.array([f.Pe for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
+    return np.array([f.Pe for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient, a_low, a_high)])
 
 
-def _flank_surface_temperature(v_m_s, h_mm, w_mm, b_um, T_ambient):
+def _flank_surface_temperature(v_m_s, h_mm, w_mm, b_um, T_ambient, a_low=None, a_high=None):
     """Surface temperature at the flank/tool-exit point x/b = 1, the location
     where residual stress is evaluated."""
     Fc = float(kienzle_force(h_mm, w_mm))
     f = flash_temperature(v_m_s, Fc, w_mm / 1000.0,
                           None if b_um is None else b_um * 1e-6, T_ambient,
-                          h_m=h_mm / 1000.0)
+                          h_m=h_mm / 1000.0, a_low=a_low, a_high=a_high)
     return T_ambient + f.T_flash * normalized_shape(_FLANK_X, f.Pe)[_FLANK_IDX]
 
 
 def critical_speed(h_mm, w_mm=3.0, b_um=None, T_ambient=20.0,
-                   v_min=0.01, v_max=10.0):
+                   v_min=0.01, v_max=10.0, a_low=None, a_high=None):
     """Lowest cutting speed (m/s) at which the flank surface temperature
     exceeds the critical temperature (thermal yielding, hence surface
     tensile residual stress). nan if never reached by v_max; v_min if already
     exceeded there. Log-spaced scan, then bisection."""
     Tc = critical_temperature(T_ambient)
-    over = lambda v: _flank_surface_temperature(v, h_mm, w_mm, b_um, T_ambient) > Tc
+    over = lambda v: _flank_surface_temperature(v, h_mm, w_mm, b_um, T_ambient, a_low, a_high) > Tc
     grid = np.geomspace(v_min, v_max, 60)
     hits = [i for i, v in enumerate(grid) if over(v)]
     if not hits:

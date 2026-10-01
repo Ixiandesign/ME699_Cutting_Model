@@ -6,7 +6,7 @@ One page: process inputs in the sidebar, key results as metrics, then
   2D:  subsurface temperature field with residual-stress contours overlaid,
        a zoom on the iso-RS region, and residual stress vs depth in µm
        zoomed on the yielded layer
-  Machining: Peclet number and flash temperature vs speed, critical speed vs feed
+  Machining: Cutting force and flash temperature vs speed, critical speed vs feed
 
 Run with: uv run python app.py (or uv run streamlit run app.py).
 """
@@ -36,9 +36,9 @@ import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.ticker import MaxNLocator
 
-from model import (DATA_H, DATA_T_C, DATA_V_M_MIN, TI64, critical_speed, critical_speed_fit, flash_vs_speed,
-                   kienzle_force, pe_vs_speed, residual_stress, solve,
-                   solve_2d)
+from model import (CALIBRATION, DATA_H, DATA_T_C, DATA_V_M_MIN, KIENZLE_TI64, TI64,
+                   critical_speed, critical_speed_fit, flash_vs_speed, force_vs_feed,
+                   kienzle_force, residual_stress, solve, solve_2d)
 
 # --- Palette (dataviz skill reference instance, light mode) -----------------
 SURFACE = "#fcfcfb"
@@ -101,7 +101,7 @@ def _crop(result2d, frac=0.02):
 def _inputs():
     sb = st.sidebar
     sb.header("Inputs (Ti-6Al-4V)")
-    v = sb.number_input("Cutting speed v (m/min)", 1.0, 600.0, 200.0, step=5.0)
+    v = sb.number_input("Cutting speed v (m/min)", 1.0, 600.0, 60.0, step=5.0)
     h = sb.number_input("Feed h (mm)", 0.005, 0.5, 0.05, step=0.01, format="%.3f")
     w = sb.number_input("Width of cut w (mm)", 0.1, 20.0, 3.0, step=0.5)
     sb.subheader("Feeds to plot (mm)")
@@ -111,14 +111,11 @@ def _inputs():
     return v, h, w, feeds
 
 
-def _values_row(items):
-    """Secondary values under the main metrics, in a smaller font."""
-    cells = "".join(f'<div><div class="lbl">{k}</div><div class="val">{v}</div></div>'
-                    for k, v in items)
-    st.markdown(
-        "<style>.vals{display:flex;flex-wrap:wrap;gap:0.6rem 2rem;margin:-0.5rem 0 0.5rem}"
-        ".vals .lbl{font-size:0.8rem;opacity:0.75}.vals .val{font-size:1.15rem}</style>"
-        f'<div class="vals">{cells}</div>', unsafe_allow_html=True)
+def _values_table(rows):
+    """Name / value (with units) / kind table replacing the old metric cards."""
+    st.dataframe(
+        [{"Name": label, "Value": value, "Type": kind} for label, value, kind in rows],
+        hide_index=True, use_container_width=True)
 
 
 # --------------------------------------------------------------------- plots
@@ -225,21 +222,21 @@ def _critical_speed(h, w):
 def _machining(w, feeds):
     v = 0.1 * np.arange(1, 51)  # 0.1-5 m/s (6-300 m/min), as the workbook sweeps
     T_lines = [flash_vs_speed(v, hf, w, None, T0) for hf in feeds]
-    Pe_lines = [pe_vs_speed(v, hf, w, None, T0) for hf in feeds]
     hc = np.linspace(0.01, 0.12, 23)
+    F = force_vs_feed(hc, w)
     vc = np.array([critical_speed(x, w, None, T0) for x in hc]) * 60.0  # m/min
-    return v, T_lines, Pe_lines, hc, vc
+    return v, T_lines, hc, F, vc
 
 
 def _plot_machining(w, feeds):
-    """Pe vs speed, flash T vs speed (workbook axes: 0-300 m/min)
+    """Force vs feed, flash T vs speed (workbook axes: 0-300 m/min)
     and critical speed vs feed (m/min, h from 0)."""
-    v, T_lines, Pe_lines, hc, vc = _machining(w, feeds)
+    v, T_lines, hc, F, vc = _machining(w, feeds)
 
-    fig_p, ax = _axes("Peclet number vs cutting speed", "Cutting speed (m/s)", "Peclet number")
-    for color, hf, Pe in zip(FEED_COLORS, feeds, Pe_lines):
-        ax.plot(v, Pe, color=color, linewidth=2, label=f"h = {hf:g} mm")
-    ax.set_xlim(0.0, 5.0)
+    fig_f, ax = _axes(f"Cutting force vs feed (Kienzle fit, w = {w:g} mm)", "Feed h (mm)", "Cutting force Fc (N)")
+    C, n = KIENZLE_TI64
+    ax.plot(hc, F, color=BLUE, linewidth=2, label=f"Fc = {C:.4g}·h^{n + 1.0:.4g}·w")
+    ax.set_xlim(0.0, 0.125)
     ax.set_ylim(bottom=0.0)
     ax.legend(frameon=False, fontsize=8)
 
@@ -264,7 +261,7 @@ def _plot_machining(w, feeds):
     ax.set_xlim(0.0, 0.125)
     ax.set_ylim(bottom=0.0)
     ax.legend(frameon=False, fontsize=8)
-    return (fig_p, fig_t, fig_c), fit
+    return (fig_f, fig_t, fig_c), fit
 
 
 # ---------------------------------------------------------------------- page
@@ -282,25 +279,41 @@ def main():
     if not r.converged:
         st.error(f"Flash temperature did not converge in {r.iterations} iterations.")
 
-    m = st.columns(6)
-    m[0].metric("Peak surface T", f"{T0 + r.T_flash:.1f} °C")
-    m[1].metric("Flash rise ΔT", f"{r.T_flash:.1f} K")
-    m[2].metric("Peclet number", f"{r.Pe:.3f}")
-    m[3].metric("Critical T (yield)", f"{r2.T_critical_C:.1f} °C")
-    m[4].metric("Surface RS at flank", f"{r2.residual_stress_MPa[0]:.1f} MPa")
     yielded = r2.z_over_b[r2.residual_stress_MPa > 0]
-    m[5].metric("Yielded depth", f"{yielded.max() * b:.1f} µm" if yielded.size else "0 µm")
-    _values_row([
-        ("Cutting force Fc (Kienzle)", f"{Fc:.1f} N"),
-        ("Contact half-width b (shear plane)", f"{b:.1f} µm"),
-        ("Heat partition R", f"{r.R:.2f}"),
-        ("Density ρ", f"{TI64['rho']:g} kg/m³"),
-        ("k at convergence", f"{r.k:.2f} W/(m·K)"),
-        ("cp at convergence", f"{r.cp:.1f} J/(kg·K)"),
-        ("Initial guess (T₀ + T_melt)/2", f"{r.history[0]:.0f} °C"),
-        ("Iterations", f"{r.iterations}"),
-        ("Critical speed at this h", f"{v_crit * 60:.1f} m/min" if np.isfinite(v_crit) else "> 600 m/min"),
-        ("Critical speed fit", f"v = {fit[0]:.4g}·h^{fit[1]:.3f} (m/min, mm)" if fit else "n/a"),
+    _values_table([
+        # -- inputs (sidebar) --
+        ("Cutting speed v", f"{v:.1f} m/min", "input"),
+        ("Feed h", f"{h:.3f} mm", "input"),
+        ("Width of cut w", f"{w:.2f} mm", "input"),
+        ("Sweep feeds (machining plots)", ", ".join(f"{x:g}" for x in feeds) + " mm", "input"),
+        # -- hardcoded constants --
+        ("Ambient temperature T₀", f"{T0:.1f} °C", "hardcoded"),
+        ("Density ρ", f"{TI64['rho']:g} kg/m³", "hardcoded"),
+        ("Melting point T_melt", f"{TI64['T_melt']:g} °C", "hardcoded"),
+        ("Poisson's ratio ν", f"{TI64['poisson']:g}", "hardcoded"),
+        # -- fitted to reference/measured data --
+        ("Kienzle coefficients (C, n)", f"{KIENZLE_TI64[0]:g}, {KIENZLE_TI64[1]:g}", "fit"),
+        ("RS fit (slope, intercept)", f"{TI64['rs_fit'][0]:g}, {TI64['rs_fit'][1]:g}", "fit"),
+        ("Flash-T calibration (a_low, a_high)",
+         f"{CALIBRATION['a_low']:.4f}, {CALIBRATION['a_high']:.4f}", "fit"),
+        ("Critical speed fit (a, n)",
+         f"v = {fit[0]:.4g}·h^{fit[1]:.3f}" if fit else "n/a", "fit"),
+        # -- calculated from the above each run --
+        ("Cutting force Fc (Kienzle)", f"{Fc:.1f} N", "calculated"),
+        ("Contact half-width b (shear-plane)", f"{b:.1f} µm", "calculated"),
+        ("Heat partition R (shear-plane)", f"{r.R:.2f}", "calculated"),
+        ("Peak surface temperature", f"{T0 + r.T_flash:.1f} °C", "calculated"),
+        ("Flash temperature rise ΔT_flash", f"{r.T_flash:.1f} K", "calculated"),
+        ("Peclet number Pe", f"{r.Pe:.3f}", "calculated"),
+        ("Conductivity k at convergence", f"{r.k:.2f} W/(m·K)", "calculated"),
+        ("Specific heat cp at convergence", f"{r.cp:.1f} J/(kg·K)", "calculated"),
+        ("Initial guess (T₀ + T_melt)/2", f"{r.history[0]:.0f} °C", "calculated"),
+        ("Iterations to converge", f"{r.iterations}", "calculated"),
+        ("Critical (yield) temperature T_crit", f"{r2.T_critical_C:.1f} °C", "calculated"),
+        ("Surface RS at flank", f"{r2.residual_stress_MPa[0]:.1f} MPa", "calculated"),
+        ("Yielded depth", f"{yielded.max() * b:.1f} µm" if yielded.size else "0 µm", "calculated"),
+        ("Critical speed at this h",
+         f"{v_crit * 60:.1f} m/min" if np.isfinite(v_crit) else "> 600 m/min", "calculated"),
     ])
 
     st.subheader("Surface (1D)")
