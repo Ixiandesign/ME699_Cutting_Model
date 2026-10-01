@@ -42,7 +42,8 @@ import numpy as np
 import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 
-from model import MATERIALS, kienzle_force, solve, solve_2d
+from model import (MATERIALS, critical_speed, critical_speed_fit, flash_vs_speed,
+                   force_vs_feed, kienzle_force, solve, solve_2d)
 
 # --- Palette (dataviz skill reference instance, light mode) -----------------
 SURFACE = "#fcfcfb"
@@ -310,6 +311,39 @@ def _draw_2d(result2d, Pe):
     return fig_field, fig_rs
 
 
+FEED_COLORS = ["#2a78d6", "#eb6834", "#1a9850", "#8e44ad", "#c0392b", "#7f8c8d"]
+
+
+def _draw_machining(w, b, feeds):
+    """Assignment plots: force vs feed, flash T vs speed (one line per feed),
+    and critical speed vs feed with a power-law fit. Ti-6Al-4V only."""
+    h = np.linspace(0.01, 0.10, 50)
+    fig_f, ax = _new_figure()
+    _style_axes(ax, f"Cutting force vs feed (w = {w:g} mm)", "Cutting force Fc (N)")
+    ax.set_xlabel("Feed / uncut chip thickness h (mm)", color=INK_SECONDARY)
+    ax.plot(h, force_vs_feed(h, w), color=SERIES_NORM, linewidth=2)
+
+    v = np.geomspace(0.1, 10.0, 40)
+    fig_t, ax = _new_figure()
+    _style_axes(ax, f"Flash temperature vs cutting speed (b = {b:g} µm)", "Peak temperature (°C)")
+    ax.set_xlabel("Cutting speed (m/s)", color=INK_SECONDARY)
+    ax.set_xscale("log")
+    for color, hf in zip(FEED_COLORS, feeds):
+        ax.plot(v, flash_vs_speed(v, hf, w, b), color=color, linewidth=2, label=f"h = {hf:g} mm")
+    ax.legend(frameon=False)
+
+    hc = np.linspace(0.02, 0.10, 17)
+    vc = np.array([critical_speed(x, w, b) for x in hc])
+    a, n = critical_speed_fit(hc, vc)
+    fig_c, ax = _new_figure()
+    _style_axes(ax, "Critical speed for surface tensile stress", "Critical cutting speed (m/s)")
+    ax.set_xlabel("Feed h (mm)", color=INK_SECONDARY)
+    ax.plot(hc, vc, "o", color=SERIES_ACTUAL, label="model")
+    ax.plot(hc, a * hc**n, color=INK_MUTED, linestyle="--", label=f"fit: v = {a:.4g}·h^{n:.3f}")
+    ax.legend(frameon=False)
+    return fig_f, fig_t, fig_c, a, n
+
+
 def main():
     st.set_page_config(page_title="Cutting Thermal Model", layout="wide")
     _init_state()
@@ -328,7 +362,8 @@ def main():
     if not result.converged:
         st.error("Solver: not converged")
 
-    tab_overview, tab_1d, tab_2d = st.tabs(["Overview", "1D view", "2D view"])
+    tab_overview, tab_1d, tab_2d, tab_mach = st.tabs(
+        ["Overview", "1D view", "2D view", "Machining (Ti-6Al-4V)"])
     result2d = solve_2d(material, v, Fc_N, w, b, x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
 
     with tab_overview:
@@ -370,6 +405,22 @@ def main():
         col1, col2 = st.columns(2)
         col1.pyplot(fig_norm, clear_figure=True)
         col2.pyplot(fig_actual, clear_figure=True)
+
+    with tab_mach:
+        feeds = st.multiselect("Feeds for flash-temperature lines (mm)",
+                               [0.01, 0.02, 0.03, 0.05, 0.07, 0.10],
+                               default=[0.01, 0.05, 0.10])
+        st.caption("Force from the Ti-6Al-4V Kienzle fit; uses the sidebar width of cut w and "
+                   "contact half-width b. Critical speed = lowest speed at which the flank "
+                   "(x/b = 1) surface temperature exceeds the thermal-yield temperature.")
+        fig_f, fig_t, fig_c, a, n = _draw_machining(
+            st.session_state["w_mm"], st.session_state["b_um"], feeds)
+        c1, c2, c3 = st.columns(3)
+        for col, fig in zip((c1, c2, c3), (fig_f, fig_t, fig_c)):
+            fig.tight_layout()
+            col.pyplot(fig, clear_figure=True)
+        st.markdown(f"**Critical speed fit:** v_crit ≈ {a:.4g} · h^{n:.3f} "
+                    "(v in m/s, h in mm; h = 0.01 mm never reaches it below 10 m/s)")
 
     with tab_2d:
         st.caption(

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
-from scipy.special import erf, k0, k1
+from scipy.special import erf, k0e, k1e
 
 # ================================================================ materials
 # k, cp, E, alpha, sigma_y are functions of temperature T (deg C) so one
@@ -85,6 +85,7 @@ MATERIALS = {
 # Kienzle fit kc(h) = C * h**n (h in mm, kc in N/mm^2) from ref/Cutting Force
 # Data.xlsx. Ti-6Al-4V only: the force data for other alloys doesn't match the
 # alloys that have thermal data.
+TI64 = "Ti-6Al-4V"
 KIENZLE_TI64 = (1792.69, -0.11672)
 
 
@@ -161,10 +162,18 @@ def normalized_shape(x_over_b, Pe):
     Pp = _safe(Pe * (x + 1.0) / 2.0)
     Pm = _safe(Pe * (x - 1.0) / 2.0)
 
-    plus_neg = (x + 1.0) * np.exp(Pp) * (k0(-Pp) - k1(-Pp))
-    plus_pos = (x + 1.0) * np.exp(Pp) * (k0(Pp) + k1(Pp))
-    minus_neg = (1.0 - x) * np.exp(Pm) * (k0(-Pm) - k1(-Pm))
-    minus_pos = (1.0 - x) * np.exp(Pm) * (k0(Pm) + k1(Pm))
+    # exp(P)*K(|P|) written with scaled Bessel functions (k0e = exp(|P|)*k0)
+    # so large Pe (fast cutting) doesn't overflow.
+    def pos(P):  # exp(P) * (K0(P) + K1(P)),  P > 0
+        P = np.abs(P)
+        return k0e(P) + k1e(P)
+
+    def neg(P):  # exp(P) * (K0(-P) - K1(-P)),  P < 0
+        P = np.abs(P)
+        return np.exp(-2.0 * P) * (k0e(P) - k1e(P))
+
+    plus_neg, plus_pos = (x + 1.0) * neg(Pp), (x + 1.0) * pos(Pp)
+    minus_neg, minus_pos = (1.0 - x) * neg(Pm), (1.0 - x) * pos(Pm)
 
     raw = np.select([x < -1.0, x > 1.0],
                     [plus_neg + minus_neg, plus_pos + minus_pos],
@@ -277,3 +286,63 @@ def solve_2d(material, v_m_min, Fc_N, w_mm, b_um, T_ambient=20.0,
     T_crit = critical_temperature(material, T_ambient)
     return TwoDResult(x, z, field, T_flank, residual_stress(material, T_flank, T_crit),
                       T_crit, float(x[flank_idx]), f.Pe, f.T_flash, f.converged)
+
+
+# ============================================== machining sweeps (assignment)
+# Force, flash temperature and critical speed vs feed h (uncut chip thickness)
+# and cutting speed v (m/s). Force comes from the Kienzle fit, so these are
+# Ti-6Al-4V only. Contact half-width b and width of cut w are held fixed.
+_FLANK_X = np.linspace(-3.0, 5.0, 801)  # contains x/b = 1.0 exactly
+_FLANK_IDX = 500
+
+
+def force_vs_feed(h_mm, w_mm=3.0):
+    """Estimated cutting force Fc (N) for each feed h (mm)."""
+    return kienzle_force(np.asarray(h_mm, dtype=float), w_mm)
+
+
+def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0):
+    """Peak surface temperature (deg C) for each cutting speed (m/s) at feed h."""
+    Fc = float(kienzle_force(h_mm, w_mm))
+    return np.array([
+        T_ambient + flash_temperature(TI64, v, Fc, w_mm / 1000.0, b_um * 1e-6,
+                                      T_ambient).T_flash
+        for v in np.atleast_1d(v_m_s)])
+
+
+def _flank_surface_temperature(v_m_s, h_mm, w_mm, b_um, T_ambient):
+    """Surface temperature at the flank/tool-exit point x/b = 1, the location
+    where residual stress is evaluated."""
+    Fc = float(kienzle_force(h_mm, w_mm))
+    f = flash_temperature(TI64, v_m_s, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient)
+    return T_ambient + f.T_flash * normalized_shape(_FLANK_X, f.Pe)[_FLANK_IDX]
+
+
+def critical_speed(h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0,
+                   v_min=0.01, v_max=10.0):
+    """Lowest cutting speed (m/s) at which the flank surface temperature
+    exceeds Ti-6Al-4V's critical temperature (thermal yielding, hence surface
+    tensile residual stress). nan if never reached by v_max; v_min if already
+    exceeded there. Log-spaced scan, then bisection."""
+    Tc = critical_temperature(TI64, T_ambient)
+    over = lambda v: _flank_surface_temperature(v, h_mm, w_mm, b_um, T_ambient) > Tc
+    grid = np.geomspace(v_min, v_max, 60)
+    hits = [i for i, v in enumerate(grid) if over(v)]
+    if not hits:
+        return float("nan")
+    if hits[0] == 0:
+        return float(v_min)
+    lo, hi = grid[hits[0] - 1], grid[hits[0]]
+    for _ in range(40):
+        mid = np.sqrt(lo * hi)
+        lo, hi = (lo, mid) if over(mid) else (mid, hi)
+    return float(hi)
+
+
+def critical_speed_fit(h_mm, v_crit):
+    """Power-law fit v_crit = a * h**n (h in mm, v in m/s) to the finite
+    points. Returns (a, n)."""
+    h, v = np.asarray(h_mm, dtype=float), np.asarray(v_crit, dtype=float)
+    ok = np.isfinite(v)
+    n, ln_a = np.polyfit(np.log(h[ok]), np.log(v[ok]), 1)
+    return float(np.exp(ln_a)), float(n)

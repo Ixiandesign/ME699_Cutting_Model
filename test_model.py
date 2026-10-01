@@ -3,7 +3,8 @@
 import numpy as np
 import pytest
 
-from model import (critical_temperature, flash_temperature, kienzle_force,
+from model import (critical_speed, critical_speed_fit, critical_temperature,
+                   flash_temperature, flash_vs_speed, force_vs_feed, kienzle_force,
                    normalized_shape, peclet_number, residual_stress, solve,
                    solve_2d, subsurface_temperature)
 
@@ -130,3 +131,27 @@ def test_direct_launch_enters_streamlit_cli():
     assert result.returncode == 0, output
     assert "missing ScriptRunContext" not in output
     assert "--server.port" in output
+
+
+# ------------------------------------------------------ machining sweeps
+def test_force_increases_with_feed():
+    F = force_vs_feed(np.linspace(0.01, 0.10, 10))
+    assert np.all(np.diff(F) > 0)
+
+
+def test_flash_increases_with_speed_and_feed():
+    v = np.array([0.1, 1.0, 10.0])
+    lo, hi = flash_vs_speed(v, 0.01), flash_vs_speed(v, 0.10)
+    assert np.all(np.isfinite(lo)) and np.all(np.diff(lo) > 0)
+    assert np.all(hi > lo)
+
+
+def test_critical_speed_decreases_with_feed():
+    vc = [critical_speed(h) for h in (0.03, 0.06, 0.10)]
+    assert np.all(np.diff(vc) < 0)
+    a, n = critical_speed_fit([0.03, 0.06, 0.10], vc)
+    assert n < 0 and a > 0
+
+
+def test_high_pe_shape_does_not_overflow():
+    assert np.isfinite(normalized_shape(np.linspace(-3, 5, 100), 300.0)).all()
