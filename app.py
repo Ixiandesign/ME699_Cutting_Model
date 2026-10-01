@@ -1,12 +1,11 @@
 """Streamlit web UI for the Peclet-normalized cutting thermal model (Ti-6Al-4V).
 
 One page: process inputs in the sidebar, key results as metrics, then
-  1D:  normalized (Peclet) surface shape, flash-temperature chain convergence,
+  1D:  normalized (Peclet) surface shape, flash-temperature convergence,
        actual surface temperature
   2D:  subsurface temperature field with residual-stress contours overlaid,
-       residual stress vs depth at the flank, thermoelastic stress vs yield
-  Machining: force vs feed, Pe vs speed, flash T vs speed (with measured data),
-       critical speed vs feed
+       residual stress vs depth at the flank (x/b = 1)
+  Machining: force vs feed, flash temperature vs speed, critical speed vs feed
 
 Run with: uv run python app.py (or uv run streamlit run app.py).
 """
@@ -36,9 +35,8 @@ import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.ticker import MaxNLocator
 
-from model import (RHO, SHEET_DATA, SHEET_DATA_H, SHEET_FEEDS, T_CRIT_SPEED, TI64,
-                   Constants, critical_speed_fit, cutting_force, feed_sweep,
-                   initial_guess, residual_stress, solve, thermoelastic_stress)
+from model import (TI64, critical_speed, critical_speed_fit, flash_vs_speed,
+                   force_vs_feed, kienzle_force, residual_stress, solve, solve_2d)
 
 # --- Palette (dataviz skill reference instance, light mode) -----------------
 SURFACE = "#fcfcfb"
@@ -49,12 +47,16 @@ GRIDLINE = "#e1e0d9"
 AXIS_COLOR = "#c3c2b7"
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
-GREEN = "#1a9850"
-SERIES = [BLUE, ORANGE, GREEN, "#8e44ad", "#c0392b", "#7f8c8d"]  # categorical
-RS_COLORS = [BLUE, GREEN, "#8e44ad", "#0f4c81"]  # one per RS contour level
+FEED_COLORS = [BLUE, ORANGE, "#1a9850"]
+RS_COLORS = [BLUE, "#1a9850", "#8e44ad", "#0f4c81"]  # one per RS contour level
 
 # Sequential light->dark ramp in the orange family for the temperature field.
 TEMP_CMAP = LinearSegmentedColormap.from_list("cutting_temp", [SURFACE, ORANGE, "#7a2e0e"])
+
+X_OVER_B = np.linspace(-3.0, 5.0, 300)
+# Quadratic spacing: fine near the surface, where the (shallow) RS lives.
+Z_OVER_B = 4.0 * np.linspace(0.0, 1.0, 200) ** 2
+SWEEP_FEEDS = (0.01, 0.05, 0.10)  # mm, one flash-vs-speed line each
 
 
 # ------------------------------------------------------------------ helpers
@@ -80,40 +82,28 @@ def _show(column, fig):
     plt.close(fig)
 
 
-def _crop(s, frac=0.02):
+def _crop(result2d, frac=0.02):
     """x/b range and max depth where the field is noticeably above ambient,
     so the heatmap isn't mostly empty far-field."""
-    rise = s.T_field_C - s.T_field_C.min()
+    rise = result2d.T_field_C - result2d.T_field_C.min()
     hot = rise > frac * rise.max() if rise.max() > 0 else np.ones_like(rise, bool)
-    x_hot = s.x_over_b[hot.any(axis=0)]
-    z_hot = s.z_over_b[hot.any(axis=1)]
+    x_hot = result2d.x_over_b[hot.any(axis=0)]
+    z_hot = result2d.z_over_b[hot.any(axis=1)]
     pad = max(0.3 * (x_hot.max() - x_hot.min()), 0.5)
-    return (max(x_hot.min() - pad, s.x_over_b[0]), min(x_hot.max() + pad, s.x_over_b[-1]),
-            min(max(1.3 * z_hot.max(), 0.15), s.z_over_b[-1]))
+    return (max(x_hot.min() - pad, X_OVER_B[0]), min(x_hot.max() + pad, X_OVER_B[-1]),
+            min(max(1.3 * z_hot.max(), 0.15), Z_OVER_B[-1]))
 
 
 # -------------------------------------------------------------------- inputs
 def _inputs():
     sb = st.sidebar
     sb.header("Inputs (Ti-6Al-4V)")
-    # Ranges are the sheet's (v 0.1-5 m/s, h up to 0.12 mm); the low-Pe polynomial
-    # C4(Pe) diverges beyond them.
-    v = sb.number_input("Cutting speed v (m/min)", 6.0, 300.0, 120.0, step=5.0)
-    h = sb.number_input("Feed h (mm)", 0.01, 0.12, 0.05, step=0.005, format="%.3f")
+    v = sb.number_input("Cutting speed v (m/min)", 1.0, 600.0, 60.0, step=5.0)
+    h = sb.number_input("Feed h (mm)", 0.005, 0.5, 0.05, step=0.01, format="%.3f")
+    b = sb.number_input("Contact half-width b (µm)", 5.0, 1000.0, 200.0, step=10.0)
     w = sb.number_input("Width of cut w (mm)", 0.1, 20.0, 3.0, step=0.5)
-    with sb.expander("Sheet constants"):
-        shear = st.number_input("Shear angle (°)", 5.0, 80.0, 35.0, step=1.0)
-        rake = st.number_input("Rake angle (°)", -30.0, 30.0, 0.0, step=1.0)
-        clearance = st.number_input("Clearance angle (°)", 1.0, 30.0, 5.0, step=1.0)
-        edge = st.number_input("Cutting edge radius (µm)", 1.0, 100.0, 10.0, step=1.0)
-        a_low = st.number_input("Calibration factor, Pe < 5", 0.1, 2.0, 0.95, step=0.05)
-        a_high = st.number_input("Calibration factor, Pe > 5", 0.1, 2.0, 0.90, step=0.05)
-        T_init = st.number_input("Initial temperature guess (°C)", 20.0, 1660.0,
-                                 initial_guess(), step=10.0)
-        T_crit_speed = st.number_input("Tc for critical speed (°C)", 100.0, 1000.0,
-                                       T_CRIT_SPEED, step=10.0)
-    return (v, h, w, Constants(shear, rake, clearance, edge, a_low, a_high),
-            T_init, T_crit_speed)
+    T0 = sb.number_input("Ambient temperature T₀ (°C)", -50.0, 200.0, 20.0, step=5.0)
+    return v, h, b, w, T0
 
 
 def _values_row(items):
@@ -127,62 +117,58 @@ def _values_row(items):
 
 
 # --------------------------------------------------------------------- plots
-def _plot_shape(s):
-    fig, ax = _axes(f"Normalized surface shape (Pe = {s.row.Pe:.2f})", "x / b", "(T − T₀) / ΔT_flash")
-    ax.plot(s.x_over_b, s.shape, color=BLUE, linewidth=2)
-    ax.plot(s.peak_x_over_b, 1.0, "o", color=BLUE)
-    ax.set_xlim(s.x_over_b[0], s.x_over_b[-1])
+def _plot_shape(r):
+    fig, ax = _axes(f"Normalized surface shape (Pe = {r.Pe:.2f})", "x / b", "(T − T₀) / ΔT_flash")
+    ax.plot(r.x_over_b, r.shape, color=BLUE, linewidth=2)
+    ax.plot(r.peak_x_over_b, 1.0, "o", color=BLUE)
+    ax.set_xlim(r.x_over_b[0], r.x_over_b[-1])
     ax.set_ylim(0, 1.1)
     return fig
 
 
-def _plot_convergence(row):
-    fig, ax = _axes("Flash temperature convergence", "Pass", "Flash temperature (°C)")
-    passes = np.arange(1, 6)
-    used_high = row.Pe > 5.0
-    ax.plot(passes, row.low, "o-", color=BLUE, linewidth=1.5, markersize=4,
-            label="Pe < 5 chain" + ("" if used_high else " (used)"))
-    ax.plot(passes, row.high, "o-", color=ORANGE, linewidth=1.5, markersize=4,
-            label="Pe > 5 chain" + (" (used)" if used_high else ""))
+def _plot_convergence(r):
+    fig, ax = _axes("Flash temperature convergence", "Iteration", "ΔT_flash (K)")
+    it = np.arange(len(r.history))  # 0 = initial guess
+    ax.plot(it, r.history, "o-", color=BLUE, linewidth=1.5, markersize=4)
+    ax.axhline(r.T_flash, color=INK_MUTED, linestyle="--", linewidth=1)
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax.legend(frameon=False, fontsize=8)
     return fig
 
 
-def _plot_surface(s):
+def _plot_surface(r, T0):
     fig, ax = _axes("Actual surface temperature", "x / b", "Temperature (°C)")
-    ax.plot(s.x_over_b, s.T_surface_C, color=ORANGE, linewidth=2)
-    ax.plot(s.peak_x_over_b, s.peak_surface_C, "o", color=ORANGE)
-    ax.set_xlim(s.x_over_b[0], s.x_over_b[-1])
+    ax.plot(r.x_over_b, r.T_actual_C, color=ORANGE, linewidth=2)
+    ax.plot(r.peak_x_over_b, T0 + r.T_flash, "o", color=ORANGE)
+    ax.set_xlim(r.x_over_b[0], r.x_over_b[-1])
     return fig
 
 
-def _plot_field(s):
-    x_lo, x_hi, z_hi = _crop(s)
-    Tc = s.T_critical_C
+def _plot_field(r2):
+    x_lo, x_hi, z_hi = _crop(r2)
+    Tc = r2.T_critical_C
     fig, ax = _axes("Subsurface temperature with residual stress", "x / b", "z / b (depth)",
                     figsize=(6.6, 3.6))
-    mesh = ax.pcolormesh(s.x_over_b, s.z_over_b, s.T_field_C, cmap=TEMP_CMAP, shading="auto")
+    mesh = ax.pcolormesh(r2.x_over_b, r2.z_over_b, r2.T_field_C, cmap=TEMP_CMAP, shading="auto")
     cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
     cbar.set_label("Temperature (°C)", color=INK_SECONDARY)
     cbar.ax.tick_params(colors=INK_MUTED)
     cbar.outline.set_visible(False)
 
-    rs = residual_stress(s.T_field_C, Tc)
+    rs = residual_stress(r2.T_field_C, Tc)
     if rs.max() > 0:
         # Yield boundary (T = T_crit), then one coloured contour per RS level.
-        ax.contour(s.x_over_b, s.z_over_b, s.T_field_C, levels=[Tc],
+        ax.contour(r2.x_over_b, r2.z_over_b, r2.T_field_C, levels=[Tc],
                    colors=[INK_PRIMARY], linewidths=1.2, linestyles="dashed")
         ax.plot([], [], "--", color=INK_PRIMARY, linewidth=1.2, label=f"T = T_crit ({Tc:.0f} °C)")
         levels = MaxNLocator(4).tick_values(0, rs.max())[1:-1]
         for color, level in zip(RS_COLORS, levels):
-            ax.contour(s.x_over_b, s.z_over_b, rs, levels=[level], colors=[color], linewidths=1.3)
+            ax.contour(r2.x_over_b, r2.z_over_b, rs, levels=[level], colors=[color], linewidths=1.3)
             ax.plot([], [], color=color, linewidth=1.3, label=f"RS = {level:.0f} MPa")
     else:
         ax.set_title("Subsurface temperature (no yielding, RS = 0)",
                      color=INK_PRIMARY, fontsize=11, loc="left")
-    ax.axvline(s.flank_x_over_b, color=INK_MUTED, linewidth=1, linestyle=":")
-    ax.plot([], [], ":", color=INK_MUTED, label=f"Flank x/b = {s.flank_x_over_b:g}")
+    ax.axvline(r2.flank_x_over_b, color=INK_MUTED, linewidth=1, linestyle=":")
+    ax.plot([], [], ":", color=INK_MUTED, label="Flank x/b = 1")
     ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.3, 1.0),
               labelcolor=INK_SECONDARY)
     ax.set_xlim(x_lo, x_hi)
@@ -190,122 +176,104 @@ def _plot_field(s):
     return fig
 
 
-def _plot_rs(s):
-    fig, ax = _axes(f"Residual stress at flank (x/b = {s.flank_x_over_b:g})",
-                    "z / b (depth)", "Residual stress (MPa)")
+def _plot_rs(r2):
+    fig, ax = _axes("Residual stress at flank (x/b = 1)", "z / b (depth)", "Residual stress (MPa)")
     ax.axhline(0.0, color=AXIS_COLOR, linewidth=1)
-    ax.plot(s.z_over_b, s.residual_stress_MPa, color=ORANGE, linewidth=2)
-    yielded = s.z_over_b[s.residual_stress_MPa > 0]
-    ax.set_xlim(0, 1.5 * yielded.max() if yielded.size else _crop(s)[2])
+    ax.plot(r2.z_over_b, r2.residual_stress_MPa, color=ORANGE, linewidth=2)
+    yielded = r2.z_over_b[r2.residual_stress_MPa > 0]
+    ax.set_xlim(0, 1.5 * yielded.max() if yielded.size else _crop(r2)[2])
     return fig
 
 
-def _plot_stress_vs_T(Tc):
-    T = np.arange(20.0, 1001.0)
-    yield_strength, thermal = TI64["sigma_y"](T), thermoelastic_stress(T)
-    fig, ax = _axes("Thermoelastic stress vs yield strength", "Temperature (°C)", "Stress (MPa)")
-    ax.plot(T, yield_strength, color=BLUE, linewidth=2, label="Yield strength")
-    ax.plot(T, thermal, color=ORANGE, linewidth=2, label="Thermoelastic stress")
-    ax.plot(T, np.maximum(thermal - yield_strength, 0.0), color=GREEN, linewidth=2,
-            label="Excess over yield")
-    ax.axvline(Tc, color=INK_PRIMARY, linestyle="--", linewidth=1, label=f"T_crit = {Tc:.0f} °C")
-    ax.legend(frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2)
-    return fig
+@st.cache_data(show_spinner=False)
+def _critical_speed(h, w, b, T0):
+    return critical_speed(h, w, b, T0)
 
 
-def _plot_force(w, h_now):
-    h = np.linspace(0.01, 0.12, 50)
-    fig, ax = _axes(f"Cutting force vs feed (w = {w:g} mm)", "Feed h (mm)", "Cutting force Fc (N)")
-    ax.plot(h, cutting_force(h, w), color=BLUE, linewidth=2)
-    ax.plot(h_now, cutting_force(h_now, w), "o", color=BLUE)
-    return fig
+@st.cache_data(show_spinner="Computing machining sweeps…")
+def _machining(w, b, T0):
+    h = np.linspace(0.01, 0.10, 50)
+    v = np.geomspace(0.1, 10.0, 40)
+    T_lines = [flash_vs_speed(v, hf, w, b, T0) for hf in SWEEP_FEEDS]
+    hc = np.linspace(0.01, 0.10, 19)
+    vc = np.array([critical_speed(x, w, b, T0) for x in hc])
+    return h, force_vs_feed(h, w), v, T_lines, hc, vc
 
 
-def _plot_pe_speed(sweeps):
-    fig, ax = _axes("Peclet number vs cutting speed", "Cutting speed (m/s)", "Pe (average)")
-    for color, fs in zip(SERIES, sweeps):
-        ax.plot(fs.v_m_min / 60.0, fs.Pe, color=color, linewidth=2, label=f"h = {fs.h_mm:g} mm")
-    ax.legend(frameon=False, fontsize=8)
-    return fig
+def _plot_machining(w, b, T0):
+    h, F, v, T_lines, hc, vc = _machining(w, b, T0)
 
+    fig_f, ax = _axes(f"Cutting force vs feed (w = {w:g} mm)", "Feed h (mm)", "Cutting force Fc (N)")
+    ax.plot(h, F, color=BLUE, linewidth=2)
 
-def _plot_T_speed(sweeps):
-    fig, ax = _axes("Flash temperature vs cutting speed", "Cutting speed (m/min)", "Temperature (°C)")
-    for color, fs in zip(SERIES, sweeps):
-        ax.plot(fs.v_m_min, fs.T_flash, color=color, linewidth=2, label=f"h = {fs.h_mm:g} mm")
-    v, T = zip(*SHEET_DATA)
-    ax.plot(v, T, "o", color=INK_PRIMARY, markersize=5, label=f"Data (h = {SHEET_DATA_H:g} mm)")
-    ax.legend(frameon=False, fontsize=8)
-    return fig
+    fig_t, ax = _axes("Peak temperature vs cutting speed", "Cutting speed (m/s)", "Peak temperature (°C)")
+    ax.set_xscale("log")
+    for color, hf, T in zip(FEED_COLORS, SWEEP_FEEDS, T_lines):
+        ax.plot(v, T, color=color, linewidth=2, label=f"h = {hf:g} mm")
+    ax.legend(frameon=False)
 
-
-def _plot_vcrit(sweeps, Tc):
-    h = np.array([fs.h_mm for fs in sweeps])
-    fig, ax = _axes(f"Critical speed for T = {Tc:g} °C", "Feed h (mm)", "Critical speed (m/min)")
-    ax.plot(h, [fs.v_crit_power for fs in sweeps], "o", color=BLUE, label="Power-law fit")
-    ax.plot(h, [fs.v_crit_log for fs in sweeps], "o", color=ORANGE, label="Log fit")
-    ax.plot(h, [fs.v_crit_avg for fs in sweeps], "o", color=GREEN, label="Average")
-    a, n = critical_speed_fit(h, [fs.v_crit_avg for fs in sweeps])
-    hh = np.linspace(h.min(), h.max(), 100)
-    ax.plot(hh, a * hh**n, "--", color=INK_MUTED, label=f"Average fit: v = {a:.3g}·h^{n:.3f}")
-    ax.legend(frameon=False, fontsize=8)
-    return fig
+    fig_c, ax = _axes("Critical speed for tensile surface RS", "Feed h (mm)", "Critical speed (m/s)")
+    ok = np.isfinite(vc)
+    fit = None
+    if ok.sum() >= 2:
+        a, n = critical_speed_fit(hc, vc)
+        fit = (a, n)
+        ax.plot(hc[ok], a * hc[ok] ** n, color=INK_MUTED, linestyle="--",
+                label=f"v = {a:.3g}·h^{n:.3f}")
+    ax.plot(hc[ok], vc[ok], "o", color=ORANGE, label="model")
+    ax.legend(frameon=False)
+    return (fig_f, fig_t, fig_c), fit
 
 
 # ---------------------------------------------------------------------- page
 def main():
     st.set_page_config(page_title="Ti-6Al-4V Cutting Thermal Model", layout="wide")
-    v, h, w, consts, T_init, T_crit_speed = _inputs()
-    s = solve(v, h, w, consts, T_init)
-    r = s.row
-    feeds = sorted({*SHEET_FEEDS, round(h, 6)})
-    sweeps = [feed_sweep(x, w, T_init, consts, T_crit_speed) for x in feeds]
-    here = sweeps[feeds.index(round(h, 6))]
+    v, h, b, w, T0 = _inputs()
+    Fc = float(kienzle_force(h, w))
+    r = solve(v, Fc, w, b, T0)
+    r2 = solve_2d(v, Fc, w, b, T0, x_over_b=X_OVER_B, z_over_b=Z_OVER_B)
+    figs, fit = _plot_machining(w, b, T0)
+    v_crit = _critical_speed(h, w, b, T0)
 
     st.title("Ti-6Al-4V Cutting Thermal Model")
+    if not r.converged:
+        st.error(f"Flash temperature did not converge in {r.iterations} iterations.")
 
     m = st.columns(6)
-    m[0].metric("Peak surface T", f"{s.peak_surface_C:.1f} °C")
-    m[1].metric("Flash temperature ΔT", f"{r.T_flash:.1f} °C")
+    m[0].metric("Peak surface T", f"{T0 + r.T_flash:.1f} °C")
+    m[1].metric("Flash rise ΔT", f"{r.T_flash:.1f} K")
     m[2].metric("Peclet number", f"{r.Pe:.3f}")
-    m[3].metric("Critical T (yield)", f"{s.T_critical_C:.1f} °C")
-    m[4].metric("Surface RS at flank", f"{s.residual_stress_MPa[0]:.1f} MPa")
-    yielded = s.z_over_b[s.residual_stress_MPa > 0]
-    m[5].metric("Yielded depth", f"{yielded.max() * r.b * 1e6:.1f} µm" if yielded.size else "0 µm")
+    m[3].metric("Critical T (yield)", f"{r2.T_critical_C:.1f} °C")
+    m[4].metric("Surface RS at flank", f"{r2.residual_stress_MPa[0]:.1f} MPa")
+    yielded = r2.z_over_b[r2.residual_stress_MPa > 0]
+    m[5].metric("Yielded depth", f"{yielded.max() * b:.1f} µm" if yielded.size else "0 µm")
     _values_row([
-        ("Cutting force Fc", f"{r.Fc:.1f} N"),
-        ("Contact half-width b", f"{r.b * 1e6:.1f} µm"),
-        ("Contact length 2b", f"{2 * r.b * 1e6:.1f} µm"),
-        ("Heat partition R", f"{r.partition:.3f}"),
-        ("Pe (shear plane)", f"{r.Pe_shear:.3f}"),
-        ("k at initial T", f"{r.k:.2f} W/(m·K)"),
-        ("cp at initial T", f"{r.cp:.1f} J/(kg·K)"),
-        ("Density ρ", f"{RHO:g} kg/m³"),
-        ("Initial guess", f"{r.T_initial:.0f} °C"),
-        ("Flash chain used", "Pe > 5" if r.Pe > 5 else "Pe < 5"),
-        ("Critical speed, power law", f"{here.v_crit_power:.1f} m/min"),
-        ("Critical speed, log fit", f"{here.v_crit_log:.1f} m/min"),
-        ("Critical speed, average", f"{here.v_crit_avg:.1f} m/min"),
+        ("Cutting force Fc (Kienzle)", f"{Fc:.1f} N"),
+        ("Contact length 2b", f"{2 * b:g} µm"),
+        ("Density ρ", f"{TI64['rho']:g} kg/m³"),
+        ("k at convergence", f"{r.k:.2f} W/(m·K)"),
+        ("cp at convergence", f"{r.cp:.1f} J/(kg·K)"),
+        ("Initial guess (T₀ + T_melt)/2", f"{r.history[0]:.0f} °C"),
+        ("Iterations", f"{r.iterations}"),
+        ("Critical speed at this h", f"{v_crit:.3f} m/s" if np.isfinite(v_crit) else "> 10 m/s"),
+        ("Critical speed fit", f"v = {fit[0]:.4g}·h^{fit[1]:.3f}" if fit else "n/a"),
     ])
 
     st.subheader("Surface (1D)")
     c = st.columns(3)
-    _show(c[0], _plot_shape(s))
+    _show(c[0], _plot_shape(r))
     _show(c[1], _plot_convergence(r))
-    _show(c[2], _plot_surface(s))
+    _show(c[2], _plot_surface(r, T0))
 
     st.subheader("Subsurface (2D)")
-    c = st.columns([1.4, 1, 1])
-    _show(c[0], _plot_field(s))
-    _show(c[1], _plot_rs(s))
-    _show(c[2], _plot_stress_vs_T(s.T_critical_C))
+    c = st.columns([1.3, 1])
+    _show(c[0], _plot_field(r2))
+    _show(c[1], _plot_rs(r2))
 
     st.subheader("Machining sweeps")
-    c = st.columns(4)
-    _show(c[0], _plot_force(w, h))
-    _show(c[1], _plot_pe_speed(sweeps))
-    _show(c[2], _plot_T_speed(sweeps))
-    _show(c[3], _plot_vcrit(sweeps, T_crit_speed))
+    c = st.columns(3)
+    for col, fig in zip(c, figs):
+        _show(col, fig)
 
 
 if __name__ == "__main__":

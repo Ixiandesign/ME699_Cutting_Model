@@ -1,19 +1,12 @@
-"""Run with: pytest
-
-Reference numbers are cached values from
-ref/ME599 Spreadsheet with RS and Ti64, 304SS and AA6061.xlsx
-(sheets '0.02 (master)' and 'Ti64').
-"""
+"""Run with: pytest"""
 
 import numpy as np
 import pytest
 
-from model import (TI64, SHEET_FEEDS, Constants, critical_temperature, cutting_force,
-                   critical_speed_fit, feed_sweep, flash_row, initial_guess,
+from model import (critical_speed, critical_speed_fit, critical_temperature,
+                   flash_temperature, flash_vs_speed, force_vs_feed, kienzle_force,
                    normalized_shape, peclet_number, residual_stress, solve,
-                   speed_sweep, subsurface_temperature)
-
-SHEET_GUESS = {0.015: 20.0, 0.03: 100.0, 0.05: 180.0, 0.08: 180.0, 0.12: 210.0}
+                   solve_2d, subsurface_temperature)
 
 
 # ---------------------------------------------------------------- 1D shape
@@ -31,6 +24,7 @@ def test_peclet_matches_reference_workbook():
 
 @pytest.mark.parametrize("Pe", [0.5, 5.0, 14.925, 50.0])
 def test_shape_continuous_at_branch_boundaries(Pe):
+    # Would catch the dead-middle-branch bug in Subsurface_thermal.m line 52.
     # Left/right limits converge only logarithmically, hence delta and rel.
     delta = 1e-6
     for boundary in (-1.0, 1.0):
@@ -43,138 +37,79 @@ def test_peak_shifts_toward_leading_edge_as_pe_increases():
     assert x[np.argmax(normalized_shape(x, 50.0))] > x[np.argmax(normalized_shape(x, 0.5))]
 
 
-def test_high_pe_shape_does_not_overflow():
-    assert np.isfinite(normalized_shape(np.linspace(-3, 5, 100), 300.0)).all()
+# --------------------------------------------------------- flash + force
+def test_flash_temperature_matlab_defaults():
+    f = flash_temperature(1.0, 50.0, 0.003, 0.0002)
+    assert f.converged
+    assert f.T_flash == pytest.approx(193.81, abs=0.5)
+    assert f.Pe == pytest.approx(30.94, abs=0.1)
 
 
-# ------------------------------------------- master sheet: one speed row
-def test_cutting_force_matches_sheet():
-    assert cutting_force(0.03, 3.0) == pytest.approx(170.25412860768057, rel=1e-12)
-    assert cutting_force(0.05, 3.0) == pytest.approx(267.2945465051952, rel=1e-12)
+def test_kienzle_force_positive():
+    assert kienzle_force(0.1, 3.0) > 0
 
 
-def test_first_row_matches_sheet():
-    """Sheet '0.02 (master)' row 21: h = 0.03, v = 0.1 m/s, Ti = 100 C."""
-    r = flash_row(0.1, 100.0, 0.03, 3.0)
-    assert r.b == pytest.approx(9.611447188795385e-05, rel=1e-10)
-    assert r.partition == pytest.approx(0.821617689354759, rel=1e-10)
-    assert r.Pe_first == pytest.approx(1.6749139500146306, rel=1e-10)
-    assert r.low == pytest.approx((195.78721148872694, 170.36048967452587, 176.75226745997,
-                                   175.12213759201245, 175.53637234828025), rel=1e-10)
-    assert r.high == pytest.approx((122.07778680014044, 238.58226855524833, 213.94324300826878,
-                                    218.61049635113548, 217.7078545262429), rel=1e-10)
-    assert r.Pe == pytest.approx(1.4964147619594401, rel=1e-10)
-    assert r.T_flash == pytest.approx(174.44281676869713, rel=1e-10)  # Pe < 5: low chain
+# ------------------------------------------------------------- subsurface
+def test_surface_matches_1d_model():
+    args = (60.0, 50.0, 3.0, 200.0)
+    profile = solve(*args)
+    field = solve_2d(*args, z_over_b=np.array([0.0]))
+    assert np.allclose(
+        field.T_field_C[0],
+        np.interp(field.x_over_b, profile.x_over_b, profile.T_actual_C),
+        atol=1e-6,
+    )
 
 
-def test_high_pe_row_uses_high_chain():
-    """Sheet row 60 (v = 4 m/s) has Pe > 5, so BB = BA."""
-    rows = speed_sweep(0.03, 3.0, 100.0)
-    assert rows[39].v_m_s == pytest.approx(4.0)
-    assert rows[39].Pe > 5.0
-    assert rows[39].T_flash == pytest.approx(495.8712123182618, rel=1e-10)
-    assert rows[49].T_flash == pytest.approx(512.9068066680532, rel=1e-10)
+def test_temperature_nonincreasing_with_depth():
+    field = solve_2d(60.0, 50.0, 3.0, 200.0, z_over_b=np.linspace(0.0, 4.0, 50))
+    flank_idx = int(np.argmin(np.abs(field.x_over_b - 1.0)))
+    assert np.all(np.diff(field.T_field_C[:, flank_idx]) <= 1e-9)
 
 
-def test_speed_sweep_carries_temperature_between_rows():
-    rows = speed_sweep(0.03, 3.0, 100.0)
-    assert rows[0].T_initial == 100.0
-    assert all(b.T_initial == a.T_flash for a, b in zip(rows, rows[1:]))
+def test_temperature_floors_at_ambient_far_from_surface():
+    result = subsurface_temperature(
+        x_over_b=np.array([0.5]), z_over_b=np.array([100.0]), Pe=30.0,
+        T_flash=200.0, T_ambient=20.0, k=6.6, cp=550.0, rho=4500.0,
+        v_m_s=1.0, b_m=2e-4)
+    assert result[0, 0] == pytest.approx(20.0)
 
 
-def test_initial_guess_is_midpoint_of_ambient_and_melt():
-    assert initial_guess() == pytest.approx(840.0)
+def test_subsurface_field_is_finite():
+    field = solve_2d(60.0, 50.0, 3.0, 200.0)
+    assert np.isfinite(field.T_field_C).all()
+    assert field.T_field_C.min() >= 20.0 - 1e-9
 
 
-# --------------------------------------- master sheet: fits and critical speed
-def test_fits_and_critical_speed_match_sheet():
-    fs = feed_sweep(0.03, 3.0, 100.0)
-    assert fs.power_fit == pytest.approx((141.63204941990813, 0.23293964429094918), rel=1e-9)
-    assert fs.log_fit == pytest.approx((84.09268611399054, 37.16953188037132), rel=1e-9)
-    assert fs.v_crit_power == pytest.approx(224.7597158350457, rel=1e-9)
-    # sheet uses 2.71828 for e in the log-fit speed, hence the looser tolerance
-    assert fs.v_crit_log == pytest.approx(245.6259576616407, rel=1e-4)
-    assert fs.v_crit_avg == pytest.approx(235.1928367483432, rel=1e-4)
-
-
-def test_critical_speed_decreases_with_feed():
-    vc = [feed_sweep(h, 3.0, SHEET_GUESS[h]).v_crit_avg for h in SHEET_FEEDS]
-    assert np.all(np.diff(vc) < 0)
-    a, n = critical_speed_fit(SHEET_FEEDS, vc)
-    assert a > 0 and n < 0
-
-
-def test_flash_increases_with_feed():
-    T = [flash_row(2.0, 300.0, h, 3.0).T_flash for h in (0.02, 0.05, 0.12)]
-    assert np.all(np.diff(T) > 0)
-
-
-def test_force_increases_with_feed():
-    assert np.all(np.diff(cutting_force(np.linspace(0.01, 0.12, 12), 3.0)) > 0)
-
-
-# ----------------------------------------------- 'Ti64' sheet: subsurface + RS
-def test_critical_temperature_matches_sheet():
-    assert critical_temperature() == 480.0  # sheet I61
+# ---------------------------------------------------------- residual stress
+def test_critical_temperature_regression():
+    assert critical_temperature() == pytest.approx(479.58, abs=0.05)
 
 
 def test_residual_stress_zero_below_critical():
-    RS = residual_stress(np.array([20.0, 100.0, 200.0]), T_critical=480.0)
+    RS = residual_stress(np.array([20.0, 100.0, 200.0]), T_critical=479.58)
     assert np.all(RS == 0.0)
 
 
 def test_residual_stress_matches_fit_above_critical():
     T = np.array([500.0, 800.0])
-    assert np.allclose(residual_stress(T, 480.0), 2.8788 * T - 1365.2)
+    RS = residual_stress(T, 479.58)
+    assert np.allclose(RS, 2.8788 * T - 1365.2)
 
 
-def test_subsurface_matches_ti64_sheet():
-    """Sheet 'Ti64': v = 4 m/s, b = 20 um, Tf = 885.09 K, properties at 20 C;
-    row 62 is RS at the flank column x/b = 0.999, z/b = 0, 0.1, 0.2."""
-    k, cp = TI64["k"](20.0), TI64["cp"](20.0)
-    Pe = peclet_number(4.0, 4500.0, 2e-5, cp, k)
-    x = -2.001 + 0.1 * np.arange(44)  # sheet's x/b grid; index 30 is x/b = 0.999
-    field = subsurface_temperature(x, np.array([0.0, 0.1, 0.2]), Pe,
-                                   885.0939818816958, k, cp, 4.0, 2e-5)
-    assert residual_stress(field[:, 30], 480.0) == pytest.approx(
-        [1079.627715711081, 553.3011790874748, 64.59577961665127], rel=1e-6)
+def test_matlab_default_ti64_has_no_residual_stress():
+    # T_flash ~194 C is well below Ti64's ~480 C critical temperature.
+    result = solve_2d(60.0, 50.0, 3.0, 200.0)
+    assert result.T_critical_C == pytest.approx(479.58, abs=0.05)
+    assert np.all(result.residual_stress_MPa == 0.0)
 
 
-# ------------------------------------------------------------- full solution
-def test_surface_row_matches_1d_profile():
-    s = solve(120.0, 0.05, 3.0)
-    assert np.allclose(s.T_field_C[0], s.T_surface_C, atol=1e-6)
-
-
-def test_temperature_nonincreasing_with_depth_at_flank():
-    s = solve(120.0, 0.05, 3.0)
-    assert np.all(np.diff(s.T_flank_profile_C) <= 1e-9)
-
-
-def test_temperature_floors_at_ambient():
-    s = solve(120.0, 0.05, 3.0)
-    assert np.isfinite(s.T_field_C).all()
-    assert s.T_field_C.min() >= 20.0 - 1e-9
-
-
-def test_flank_column_is_sheet_value():
-    assert solve(120.0, 0.05, 3.0).flank_x_over_b == pytest.approx(0.999)
-
-
-def test_tensile_residual_stress_only_near_surface():
-    s = solve(120.0, 0.12, 3.0)
-    assert s.row.T_flash > s.T_critical_C
-    nonzero = np.nonzero(s.residual_stress_MPa)[0]
-    assert s.residual_stress_MPa[0] > 0 and nonzero.max() < len(s.z_over_b) // 4
-
-
-def test_low_speed_has_no_residual_stress():
-    assert np.all(solve(20.0, 0.02, 3.0).residual_stress_MPa == 0.0)
-
-
-def test_constants_change_result():
-    base = solve(120.0, 0.05, 3.0).row.T_flash
-    assert solve(120.0, 0.05, 3.0, Constants(a_low=1.0, a_high=1.0)).row.T_flash > base
+def test_high_temperature_scenario_produces_residual_stress():
+    result = solve_2d(250.0, 400.0, 3.0, 200.0)
+    assert result.T_flash > result.T_critical_C
+    assert result.residual_stress_MPa.max() > 0.0
+    nonzero = np.nonzero(result.residual_stress_MPa)[0]
+    assert nonzero.max() < len(result.z_over_b) // 2  # only near the surface
 
 
 # ---------------------------------------------------------------------- app
@@ -192,3 +127,48 @@ def test_direct_launch_enters_streamlit_cli():
     assert result.returncode == 0, output
     assert "missing ScriptRunContext" not in output
     assert "--server.port" in output
+
+
+# ------------------------------------------------------ machining sweeps
+def test_force_increases_with_feed():
+    F = force_vs_feed(np.linspace(0.01, 0.10, 10))
+    assert np.all(np.diff(F) > 0)
+
+
+def test_flash_increases_with_speed_and_feed():
+    v = np.array([0.1, 1.0, 10.0])
+    lo, hi = flash_vs_speed(v, 0.01), flash_vs_speed(v, 0.10)
+    assert np.all(np.isfinite(lo)) and np.all(np.diff(lo) > 0)
+    assert np.all(hi > lo)
+
+
+def test_critical_speed_decreases_with_feed():
+    vc = [critical_speed(h) for h in (0.03, 0.06, 0.10)]
+    assert np.all(np.diff(vc) < 0)
+    a, n = critical_speed_fit([0.03, 0.06, 0.10], vc)
+    assert n < 0 and a > 0
+
+
+def test_high_pe_shape_does_not_overflow():
+    assert np.isfinite(normalized_shape(np.linspace(-3, 5, 100), 300.0)).all()
+
+
+# ------------------------------------------- reference workbook (Ti64 sheet)
+def test_matches_ti64_example_sheet():
+    """Single pass at 20 C properties from 'ME599 Spreadsheet with RS ...xlsx',
+    sheet Ti64: v = 4 m/s, Fc = 50 N, b = 20 um, w = 5 mm."""
+    f = flash_temperature(4.0, 50.0, 0.005, 2e-5, T_initial=20.0)
+    assert f.history[1] == pytest.approx(885.0939818816958, rel=1e-9)
+    from model import TI64
+    k, cp = TI64["k"](20.0), TI64["cp"](20.0)
+    Pe = peclet_number(4.0, 4500.0, 2e-5, cp, k)
+    x = -2.001 + 0.1 * np.arange(44)  # sheet's x/b grid; index 30 is x/b = 0.999
+    field = subsurface_temperature(x, np.array([0.0, 0.1, 0.2]), Pe,
+                                   885.0939818816958, 20.0, k, cp, 4500.0, 4.0, 2e-5)
+    # Sheet row 62 (x/b = 0.999), z/b = 0, 0.1, 0.2, with Tc = 480
+    assert residual_stress(field[:, 30], 480.0) == pytest.approx(
+        [1079.627715711081, 553.3011790874748, 64.59577961665127], rel=1e-6)
+
+
+def test_initial_guess_is_midpoint_of_ambient_and_melt():
+    assert flash_temperature(1.0, 50.0, 0.003, 2e-4).history[0] == pytest.approx(840.0)
