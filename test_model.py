@@ -39,7 +39,7 @@ def test_peak_shifts_toward_leading_edge_as_pe_increases():
 
 # --------------------------------------------------------- flash + force
 def test_flash_temperature_matlab_defaults():
-    f = flash_temperature(1.0, 50.0, 0.003, 0.0002)
+    f = flash_temperature(1.0, 50.0, 0.003, 0.0002, a_low=1.0, a_high=1.0)
     assert f.converged
     assert f.T_flash == pytest.approx(193.81, abs=0.5)
     assert f.Pe == pytest.approx(30.94, abs=0.1)
@@ -143,9 +143,9 @@ def test_flash_increases_with_speed_and_feed():
 
 
 def test_critical_speed_decreases_with_feed():
-    vc = [critical_speed(h) for h in (0.03, 0.06, 0.10)]
+    vc = [critical_speed(h) for h in (0.08, 0.10, 0.12)]
     assert np.all(np.diff(vc) < 0)
-    a, n = critical_speed_fit([0.03, 0.06, 0.10], vc)
+    a, n = critical_speed_fit([0.08, 0.10, 0.12], vc)
     assert n < 0 and a > 0
 
 
@@ -157,7 +157,7 @@ def test_high_pe_shape_does_not_overflow():
 def test_matches_ti64_example_sheet():
     """Single pass at 20 C properties from 'ME599 Spreadsheet with RS ...xlsx',
     sheet Ti64: v = 4 m/s, Fc = 50 N, b = 20 um, w = 5 mm."""
-    f = flash_temperature(4.0, 50.0, 0.005, 2e-5, T_initial=20.0)
+    f = flash_temperature(4.0, 50.0, 0.005, 2e-5, T_initial=20.0, a_low=1.0, a_high=1.0)
     assert f.history[1] == pytest.approx(885.0939818816958, rel=1e-9)
     from model import TI64
     k, cp = TI64["k"](20.0), TI64["cp"](20.0)
@@ -172,3 +172,13 @@ def test_matches_ti64_example_sheet():
 
 def test_initial_guess_is_midpoint_of_ambient_and_melt():
     assert flash_temperature(1.0, 50.0, 0.003, 2e-4).history[0] == pytest.approx(840.0)
+
+
+def test_calibration_fits_data_and_is_continuous():
+    from model import CALIBRATION, DATA_T_C, DATA_V_M_MIN, DATA_H, calibrate_flash
+    cal = calibrate_flash()
+    assert cal["a_high"] == pytest.approx(CALIBRATION["a_high"], abs=1e-3)
+    assert cal["a_low"] == pytest.approx(CALIBRATION["a_low"], abs=1e-3)
+    assert cal["rms"] < 40.0
+    T = flash_vs_speed(np.array(DATA_V_M_MIN) / 60.0, DATA_H)
+    assert np.all(np.abs(T - np.array(DATA_T_C)) < 70.0)

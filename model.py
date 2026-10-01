@@ -48,6 +48,50 @@ def kienzle_force(h_mm, w_mm):
     return C * h_mm**n * h_mm * w_mm
 
 
+# Calibration factors multiplying the Pe<5 / Pe>5 flash-temperature correlations
+# (the workbook uses 0.95 / 0.90). The references give no values, so a_high is
+# fitted to the measured peak temperatures (calibrate_flash) and a_low follows
+# from continuity at Pe = 5. a_high is small because it also absorbs the
+# workbook's force factor 0.7, heat partition R and shear-plane b, which this
+# model replaces by the Kienzle force and a fixed b.
+CALIBRATION = dict(a_low=0.3479, a_high=0.3424)
+
+# Measured peak temperatures (deg C) at feed h = 0.05 mm, from the workbook.
+DATA_H = 0.05
+DATA_V_M_MIN = (20.0, 40.0, 60.0, 80.0, 100.0)
+DATA_T_C = (360.0, 400.0, 430.0, 470.0, 490.0)
+
+
+def continuity_a_low(a_high):
+    """a_low making the two correlations agree at Pe = 5 (they differ by 1.6 %
+    uncalibrated, so a_low = 1.0163 a_high)."""
+    Pe = 5.0
+    low = 0.159 * (0.00527 * Pe**3 - 0.192 * Pe**2 + 2.39 * Pe)
+    high = 0.399 * (2.0 * Pe) ** 0.5  # 0.399 sqrt(2 Pe), same prefactors as low
+    return a_high * high / low
+
+
+def calibrate_flash(v_m_min=DATA_V_M_MIN, T_peak=DATA_T_C, h_mm=DATA_H, w_mm=3.0,
+                    b_um=200.0, T_ambient=20.0):
+    """Least-squares fit of a_high to measured peak temperatures; a_low then
+    follows from continuity (the data are all Pe > 5, so it cannot be fitted
+    from them). Returns dict(a_low, a_high, rms) with rms in deg C."""
+    from scipy.optimize import least_squares
+    v = np.asarray(v_m_min, dtype=float) / 60.0
+    T = np.asarray(T_peak, dtype=float)
+    Fc = float(kienzle_force(h_mm, w_mm))
+
+    def resid(p):
+        return np.array([T_ambient + flash_temperature(
+            x, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient, a_high=p[0]).T_flash
+            for x in v]) - T
+
+    r = least_squares(resid, [0.5])
+    a_high = float(r.x[0])
+    return dict(a_low=continuity_a_low(a_high), a_high=a_high,
+                rms=float(np.sqrt(np.mean(r.fun ** 2))))
+
+
 # ================================================================ 1. flash T
 def peclet_number(v_m_s, rho, b_m, cp, k):
     """Pe = v*rho*b*cp / (2k). b = contact half-width."""
@@ -66,7 +110,7 @@ class FlashResult:
 
 
 def flash_temperature(v_m_s, Fc_N, w_m, b_m, T_ambient=20.0, T_initial=None,
-                      max_iter=200, tol=1e-3):
+                      max_iter=200, tol=1e-3, a_low=None, a_high=None):
     """Peak temperature rise by damped fixed-point iteration (k, cp depend on T).
 
     Follows Subsurface_thermal.m (x2 on Fc on both Pe branches; the Excel
@@ -74,7 +118,12 @@ def flash_temperature(v_m_s, Fc_N, w_m, b_m, T_ambient=20.0, T_initial=None,
     Adds an iteration cap (the script has none; extreme speeds can diverge)
     and a numeric tolerance instead of integer rounding. The initial guess
     defaults to halfway between ambient and the melting point.
+
+    a_low / a_high are the workbook's calibration factors multiplying the
+    Pe < 5 and Pe > 5 correlations (default CALIBRATION; see calibrate_flash).
     """
+    a_low = CALIBRATION["a_low"] if a_low is None else a_low
+    a_high = CALIBRATION["a_high"] if a_high is None else a_high
     m = TI64
     rho = m["rho"]
     T_guess = (T_ambient + m["T_melt"]) / 2.0 if T_initial is None else T_initial
@@ -89,9 +138,9 @@ def flash_temperature(v_m_s, Fc_N, w_m, b_m, T_ambient=20.0, T_initial=None,
         Pe = peclet_number(v_m_s, rho, b_m, cp, k)
         if Pe < 5:
             C4 = 0.00527 * Pe**3 - 0.192 * Pe**2 + 2.39 * Pe
-            T_flash = 0.159 * C4 * (2.0 * Fc_N) / (rho * cp * w_m * b_m)
+            T_flash = a_low * 0.159 * C4 * (2.0 * Fc_N) / (rho * cp * w_m * b_m)
         else:
-            T_flash = (0.399 * (2.0 * Fc_N * v_m_s) / (k * w_m)
+            T_flash = (a_high * 0.399 * (2.0 * Fc_N * v_m_s) / (k * w_m)
                        * (k / (rho * cp * v_m_s * b_m)) ** 0.5)
         history.append(float(T_flash))
         if abs(T_flash - T_guess) < tol:
@@ -157,14 +206,18 @@ def subsurface_temperature(x_over_b, z_over_b, Pe, T_flash, T_ambient,
 
 
 # ========================================================= 4. residual stress
+def thermoelastic_stress(T, T_ambient=20.0):
+    """Constrained thermal stress E*alpha*(T - T0)/(1 - nu), MPa."""
+    T = np.asarray(T, dtype=float)
+    return TI64["E"](T) * TI64["alpha"](T) * (T - T_ambient) / (1.0 - TI64["poisson"])
+
+
 @lru_cache(maxsize=32)
 def critical_temperature(T_ambient=20.0, T_max=2000.0, n=20000):
     """Lowest T where thermoelastic stress E*alpha*(T-T0)/(1-nu) first exceeds
     yield strength sigma_y(T). Returns inf if it never does below T_max."""
-    m = TI64
     T = np.linspace(T_ambient, T_max, n)
-    sigma_thermal = m["E"](T) * m["alpha"](T) * (T - T_ambient) / (1.0 - m["poisson"])
-    exceeds = sigma_thermal > m["sigma_y"](T)
+    exceeds = thermoelastic_stress(T, T_ambient) > TI64["sigma_y"](T)
     return float(T[np.argmax(exceeds)]) if exceeds.any() else float("inf")
 
 
@@ -258,13 +311,21 @@ def force_vs_feed(h_mm, w_mm=3.0):
     return kienzle_force(np.asarray(h_mm, dtype=float), w_mm)
 
 
+def _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient):
+    Fc = float(kienzle_force(h_mm, w_mm))
+    return [flash_temperature(v, Fc, w_mm / 1000.0, b_um * 1e-6, T_ambient)
+            for v in np.atleast_1d(v_m_s)]
+
+
 def flash_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0):
     """Peak surface temperature (deg C) for each cutting speed (m/s) at feed h."""
-    Fc = float(kienzle_force(h_mm, w_mm))
-    return np.array([
-        T_ambient + flash_temperature(v, Fc, w_mm / 1000.0, b_um * 1e-6,
-                                      T_ambient).T_flash
-        for v in np.atleast_1d(v_m_s)])
+    return np.array([T_ambient + f.T_flash
+                     for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
+
+
+def pe_vs_speed(v_m_s, h_mm, w_mm=3.0, b_um=200.0, T_ambient=20.0):
+    """Peclet number at convergence for each cutting speed (m/s) at feed h."""
+    return np.array([f.Pe for f in _flash_sweep(v_m_s, h_mm, w_mm, b_um, T_ambient)])
 
 
 def _flank_surface_temperature(v_m_s, h_mm, w_mm, b_um, T_ambient):
