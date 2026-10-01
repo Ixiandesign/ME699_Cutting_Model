@@ -8,6 +8,8 @@ dependencies = [
     "scipy",
     "matplotlib",
     "streamlit>=1.64.0",
+    "jupyterlab>=4.6.4",
+    "ipykernel>=7.3.0",
 ]
 
 [dependency-groups]

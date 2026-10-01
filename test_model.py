@@ -8,8 +8,6 @@ from model import (critical_speed, critical_speed_fit, critical_temperature,
                    normalized_shape, peclet_number, residual_stress, solve,
                    solve_2d, subsurface_temperature)
 
-TI64 = "Ti-6Al-4V"
-
 
 # ---------------------------------------------------------------- 1D shape
 @pytest.mark.parametrize("Pe", [0.1, 0.5, 5.0, 14.925, 50.0])
@@ -41,7 +39,7 @@ def test_peak_shifts_toward_leading_edge_as_pe_increases():
 
 # --------------------------------------------------------- flash + force
 def test_flash_temperature_matlab_defaults():
-    f = flash_temperature(TI64, 1.0, 50.0, 0.003, 0.0002)
+    f = flash_temperature(1.0, 50.0, 0.003, 0.0002)
     assert f.converged
     assert f.T_flash == pytest.approx(193.81, abs=0.5)
     assert f.Pe == pytest.approx(30.94, abs=0.1)
@@ -53,7 +51,7 @@ def test_kienzle_force_positive():
 
 # ------------------------------------------------------------- subsurface
 def test_surface_matches_1d_model():
-    args = (TI64, 60.0, 50.0, 3.0, 200.0)
+    args = (60.0, 50.0, 3.0, 200.0)
     profile = solve(*args)
     field = solve_2d(*args, z_over_b=np.array([0.0]))
     assert np.allclose(
@@ -64,7 +62,7 @@ def test_surface_matches_1d_model():
 
 
 def test_temperature_nonincreasing_with_depth():
-    field = solve_2d(TI64, 60.0, 50.0, 3.0, 200.0, z_over_b=np.linspace(0.0, 4.0, 50))
+    field = solve_2d(60.0, 50.0, 3.0, 200.0, z_over_b=np.linspace(0.0, 4.0, 50))
     flank_idx = int(np.argmin(np.abs(field.x_over_b - 1.0)))
     assert np.all(np.diff(field.T_field_C[:, flank_idx]) <= 1e-9)
 
@@ -78,38 +76,36 @@ def test_temperature_floors_at_ambient_far_from_surface():
 
 
 def test_subsurface_field_is_finite():
-    field = solve_2d(TI64, 60.0, 50.0, 3.0, 200.0)
+    field = solve_2d(60.0, 50.0, 3.0, 200.0)
     assert np.isfinite(field.T_field_C).all()
     assert field.T_field_C.min() >= 20.0 - 1e-9
 
 
 # ---------------------------------------------------------- residual stress
-@pytest.mark.parametrize("material,expected_Tc", [
-    (TI64, 479.58), ("AA7050", 161.78), ("304 SS", 72.87), ("AA6061", 117.92)])
-def test_critical_temperature_regression(material, expected_Tc):
-    assert critical_temperature(material) == pytest.approx(expected_Tc, abs=0.05)
+def test_critical_temperature_regression():
+    assert critical_temperature() == pytest.approx(479.58, abs=0.05)
 
 
 def test_residual_stress_zero_below_critical():
-    RS = residual_stress(TI64, np.array([20.0, 100.0, 200.0]), T_critical=479.58)
+    RS = residual_stress(np.array([20.0, 100.0, 200.0]), T_critical=479.58)
     assert np.all(RS == 0.0)
 
 
 def test_residual_stress_matches_fit_above_critical():
     T = np.array([500.0, 800.0])
-    RS = residual_stress(TI64, T, 479.58)
+    RS = residual_stress(T, 479.58)
     assert np.allclose(RS, 2.8788 * T - 1365.2)
 
 
 def test_matlab_default_ti64_has_no_residual_stress():
     # T_flash ~194 C is well below Ti64's ~480 C critical temperature.
-    result = solve_2d(TI64, 60.0, 50.0, 3.0, 200.0)
+    result = solve_2d(60.0, 50.0, 3.0, 200.0)
     assert result.T_critical_C == pytest.approx(479.58, abs=0.05)
     assert np.all(result.residual_stress_MPa == 0.0)
 
 
 def test_high_temperature_scenario_produces_residual_stress():
-    result = solve_2d(TI64, 250.0, 400.0, 3.0, 200.0)
+    result = solve_2d(250.0, 400.0, 3.0, 200.0)
     assert result.T_flash > result.T_critical_C
     assert result.residual_stress_MPa.max() > 0.0
     nonzero = np.nonzero(result.residual_stress_MPa)[0]
@@ -155,3 +151,24 @@ def test_critical_speed_decreases_with_feed():
 
 def test_high_pe_shape_does_not_overflow():
     assert np.isfinite(normalized_shape(np.linspace(-3, 5, 100), 300.0)).all()
+
+
+# ------------------------------------------- reference workbook (Ti64 sheet)
+def test_matches_ti64_example_sheet():
+    """Single pass at 20 C properties from 'ME599 Spreadsheet with RS ...xlsx',
+    sheet Ti64: v = 4 m/s, Fc = 50 N, b = 20 um, w = 5 mm."""
+    f = flash_temperature(4.0, 50.0, 0.005, 2e-5, T_initial=20.0)
+    assert f.history[1] == pytest.approx(885.0939818816958, rel=1e-9)
+    from model import TI64
+    k, cp = TI64["k"](20.0), TI64["cp"](20.0)
+    Pe = peclet_number(4.0, 4500.0, 2e-5, cp, k)
+    x = -2.001 + 0.1 * np.arange(44)  # sheet's x/b grid; index 30 is x/b = 0.999
+    field = subsurface_temperature(x, np.array([0.0, 0.1, 0.2]), Pe,
+                                   885.0939818816958, 20.0, k, cp, 4500.0, 4.0, 2e-5)
+    # Sheet row 62 (x/b = 0.999), z/b = 0, 0.1, 0.2, with Tc = 480
+    assert residual_stress(field[:, 30], 480.0) == pytest.approx(
+        [1079.627715711081, 553.3011790874748, 64.59577961665127], rel=1e-6)
+
+
+def test_initial_guess_is_midpoint_of_ambient_and_melt():
+    assert flash_temperature(1.0, 50.0, 0.003, 2e-4).history[0] == pytest.approx(840.0)

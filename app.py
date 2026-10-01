@@ -1,19 +1,11 @@
-"""Streamlit web UI for the Peclet-normalized cutting thermal model.
+"""Streamlit web UI for the Peclet-normalized cutting thermal model (Ti-6Al-4V).
 
-Runs entirely through the browser (no Tk/desktop GUI backend needed --
-matplotlib is forced onto the non-interactive Agg backend below and
-figures are handed to Streamlit as static images via st.pyplot).
-
-Two views, picked via tabs:
-- **1D view**: two single-axis panels side by side, sharing the x/b axis
-  -- the normalized surface shape (peak always 1.0) and that same curve
-  scaled by the peak ("flash") temperature into actual degrees C. A dual
-  y-axis was deliberately avoided (see the dataviz skill's "one axis"
-  rule) since it invites misreading a coincidental crossing/slope match
-  between two differently-scaled series as meaningful.
-- **2D view**: the subsurface temperature field T(x/b, z/b) as a
-  cutaway heatmap (z=0, the surface, at top), and the residual-stress-
-  vs-depth profile at the flank/tool-exit location (x/b=1).
+One page: process inputs in the sidebar, key results as metrics, then
+  1D:  normalized (Peclet) surface shape, flash-temperature convergence,
+       actual surface temperature
+  2D:  subsurface temperature field with residual-stress contours overlaid,
+       residual stress vs depth at the flank (x/b = 1)
+  Machining: force vs feed, flash temperature vs speed, critical speed vs feed
 
 Run with: uv run python app.py (or uv run streamlit run app.py).
 """
@@ -41,9 +33,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.ticker import MaxNLocator
 
-from model import (MATERIALS, critical_speed, critical_speed_fit, flash_vs_speed,
-                   force_vs_feed, kienzle_force, solve, solve_2d)
+from model import (TI64, critical_speed, critical_speed_fit, flash_vs_speed,
+                   force_vs_feed, kienzle_force, residual_stress, solve, solve_2d)
 
 # --- Palette (dataviz skill reference instance, light mode) -----------------
 SURFACE = "#fcfcfb"
@@ -52,388 +45,235 @@ INK_SECONDARY = "#52514e"
 INK_MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
 AXIS_COLOR = "#c3c2b7"
-SERIES_NORM = "#2a78d6"  # categorical slot 1 (blue)
-SERIES_ACTUAL = "#eb6834"  # categorical slot 2 (orange)
+BLUE = "#2a78d6"
+ORANGE = "#eb6834"
+FEED_COLORS = [BLUE, ORANGE, "#1a9850"]
+RS_COLORS = [BLUE, "#1a9850", "#8e44ad", "#0f4c81"]  # one per RS contour level
 
-# Sequential (single-hue, light->dark) ramp for the 2D temperature
-# field, in the same orange family as SERIES_ACTUAL.
-TEMP_CMAP = LinearSegmentedColormap.from_list(
-    "cutting_temp", [SURFACE, SERIES_ACTUAL, "#7a2e0e"]
-)
+# Sequential light->dark ramp in the orange family for the temperature field.
+TEMP_CMAP = LinearSegmentedColormap.from_list("cutting_temp", [SURFACE, ORANGE, "#7a2e0e"])
 
-TI64 = "Ti-6Al-4V"
-MATERIAL_NAMES = list(MATERIALS)
+X_OVER_B = np.linspace(-3.0, 5.0, 300)
+# Quadratic spacing: fine near the surface, where the (shallow) RS lives.
+Z_OVER_B = 4.0 * np.linspace(0.0, 1.0, 200) ** 2
+SWEEP_FEEDS = (0.01, 0.05, 0.10)  # mm, one flash-vs-speed line each
 
-APP_X_OVER_B = np.linspace(-3.0, 5.0, 300)
-APP_Z_OVER_B = np.linspace(0.0, 4.0, 150)
 
-SLIDER_SPECS = [
-    ("v_m_min", "Cutting speed vc (m/min)", 1.0, 300.0),
-    ("Fc_N", "Cutting force Fc (N)", 10.0, 1000.0),
-    ("b_um", "Contact half-width b (µm)", 10.0, 500.0),
-    ("w_mm", "Width of cut w (mm)", 1.0, 10.0),
-]
-
-def _style_axes(ax, title, ylabel):
+# ------------------------------------------------------------------ helpers
+def _axes(title, xlabel, ylabel, figsize=(5.0, 3.6)):
+    fig, ax = plt.subplots(figsize=figsize, facecolor=SURFACE)
     ax.set_facecolor(SURFACE)
     ax.set_title(title, color=INK_PRIMARY, fontsize=11, loc="left")
+    ax.set_xlabel(xlabel, color=INK_SECONDARY)
     ax.set_ylabel(ylabel, color=INK_SECONDARY)
-    ax.grid(True, color=GRIDLINE, linewidth=1.0, zorder=0)
+    ax.grid(True, color=GRIDLINE, linewidth=1.0)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):
         ax.spines[side].set_color(AXIS_COLOR)
     ax.tick_params(colors=INK_MUTED)
-
-
-def _new_figure():
-    fig, ax = plt.subplots(figsize=(6.0, 4.5), facecolor=SURFACE)
     return fig, ax
 
 
-def _apply_material_defaults():
-    """on_change callback for the material radio: reset the process
-    sliders to that material's defaults before the widgets re-render."""
-    defaults = MATERIALS[st.session_state["material"]]["defaults"]
-    st.session_state["v_m_min"] = defaults["v_m_min"]
-    st.session_state["Fc_N"] = defaults["Fc_N"]
-    st.session_state["b_um"] = defaults["b_um"]
-    st.session_state["w_mm"] = defaults["w_mm"]
+def _show(column, fig):
+    fig.tight_layout()
+    column.pyplot(fig)
+    plt.close(fig)
 
 
-def _init_state():
-    if "material" in st.session_state:
-        return
-    st.session_state["material"] = TI64
-    defaults = MATERIALS[TI64]["defaults"]
-    st.session_state["v_m_min"] = defaults["v_m_min"]
-    st.session_state["Fc_N"] = defaults["Fc_N"]
-    st.session_state["b_um"] = defaults["b_um"]
-    st.session_state["w_mm"] = defaults["w_mm"]
-    st.session_state["h_mm"] = 0.10
-    st.session_state["use_kienzle"] = False
+def _crop(result2d, frac=0.02):
+    """x/b range and max depth where the field is noticeably above ambient,
+    so the heatmap isn't mostly empty far-field."""
+    rise = result2d.T_field_C - result2d.T_field_C.min()
+    hot = rise > frac * rise.max() if rise.max() > 0 else np.ones_like(rise, bool)
+    x_hot = result2d.x_over_b[hot.any(axis=0)]
+    z_hot = result2d.z_over_b[hot.any(axis=1)]
+    pad = max(0.3 * (x_hot.max() - x_hot.min()), 0.5)
+    return (max(x_hot.min() - pad, X_OVER_B[0]), min(x_hot.max() + pad, X_OVER_B[-1]),
+            min(max(1.3 * z_hot.max(), 0.15), Z_OVER_B[-1]))
 
 
-def _build_sidebar():
-    st.sidebar.subheader("Presets")
-    st.sidebar.button("Ti64 · 50 N", on_click=_load_example, args=(50.0,))
-    st.sidebar.button("Ti64 · 200 N", on_click=_load_example, args=(200.0,))
-    st.sidebar.radio(
-        "Material", MATERIAL_NAMES, key="material", on_change=_apply_material_defaults
-    )
-    for key, label, lo, hi in SLIDER_SPECS:
-        st.sidebar.slider(label, lo, hi, key=key)
-    st.sidebar.checkbox(
-        "Estimate Fc from feed h (Kienzle fit)", key="use_kienzle"
-    )
-    st.sidebar.slider(
-        "Feed h (mm) [Kienzle, Ti-6Al-4V only]", 0.01, 0.30, key="h_mm"
-    )
+# -------------------------------------------------------------------- inputs
+def _inputs():
+    sb = st.sidebar
+    sb.header("Inputs (Ti-6Al-4V)")
+    v = sb.number_input("Cutting speed v (m/min)", 1.0, 600.0, 60.0, step=5.0)
+    h = sb.number_input("Feed h (mm)", 0.005, 0.5, 0.05, step=0.01, format="%.3f")
+    b = sb.number_input("Contact half-width b (µm)", 5.0, 1000.0, 200.0, step=10.0)
+    w = sb.number_input("Width of cut w (mm)", 0.1, 20.0, 3.0, step=0.5)
+    T0 = sb.number_input("Ambient temperature T₀ (°C)", -50.0, 200.0, 20.0, step=5.0)
+    return v, h, b, w, T0
 
 
-def _load_example(force):
-    st.session_state["material"] = TI64
-    _apply_material_defaults()
-    st.session_state["Fc_N"] = force
-    st.session_state["use_kienzle"] = False
+def _values_row(items):
+    """Secondary values under the main metrics, in a smaller font."""
+    cells = "".join(f'<div><div class="lbl">{k}</div><div class="val">{v}</div></div>'
+                    for k, v in items)
+    st.markdown(
+        "<style>.vals{display:flex;flex-wrap:wrap;gap:0.6rem 2rem;margin:-0.5rem 0 0.5rem}"
+        ".vals .lbl{font-size:0.8rem;opacity:0.75}.vals .val{font-size:1.15rem}</style>"
+        f'<div class="vals">{cells}</div>', unsafe_allow_html=True)
 
 
-def _effective_force(material):
-    if st.session_state["use_kienzle"] and material == TI64:
-        return kienzle_force(st.session_state["h_mm"], st.session_state["w_mm"])
-    return st.session_state["Fc_N"]
+# --------------------------------------------------------------------- plots
+def _plot_shape(r):
+    fig, ax = _axes(f"Normalized surface shape (Pe = {r.Pe:.2f})", "x / b", "(T − T₀) / ΔT_flash")
+    ax.plot(r.x_over_b, r.shape, color=BLUE, linewidth=2)
+    ax.plot(r.peak_x_over_b, 1.0, "o", color=BLUE)
+    ax.set_xlim(r.x_over_b[0], r.x_over_b[-1])
+    ax.set_ylim(0, 1.1)
+    return fig
 
 
-def _draw_1d(result):
-    fig_norm, ax_norm = _new_figure()
-    _style_axes(
-        ax_norm, f"Normalized surface shape (peak = 1, Pe = {result.Pe:.2f})", "(T − T₀) / ΔT_flash"
-    )
-    ax_norm.set_xlabel("x / b", color=INK_SECONDARY)
-    ax_norm.plot(result.x_over_b, result.shape, color=SERIES_NORM, linewidth=2)
-    ax_norm.plot(
-        [result.peak_x_over_b],
-        [1.0],
-        marker="o",
-        color=SERIES_NORM,
-        markersize=8,
-        markeredgecolor=SURFACE,
-        markeredgewidth=2,
-        zorder=5,
-    )
-    ax_norm.annotate(
-        f"1.00 @ x/b={result.peak_x_over_b:.2f}",
-        xy=(result.peak_x_over_b, 1.0),
-        xytext=(8, 6),
-        textcoords="offset points",
-        color=INK_PRIMARY,
-        fontsize=10,
-    )
-    ax_norm.set_xlim(result.x_over_b.min(), result.x_over_b.max())
-    ax_norm.set_ylim(0, 1.15)
-
-    fig_actual, ax_actual = _new_figure()
-    _style_axes(ax_actual, "Actual surface temperature", "Temperature (°C)")
-    ax_actual.set_xlabel("x / b", color=INK_SECONDARY)
-    T_actual_max = result.T_actual_C.max()
-    ax_actual.plot(result.x_over_b, result.T_actual_C, color=SERIES_ACTUAL, linewidth=2)
-    ax_actual.plot(
-        [result.peak_x_over_b],
-        [T_actual_max],
-        marker="o",
-        color=SERIES_ACTUAL,
-        markersize=8,
-        markeredgecolor=SURFACE,
-        markeredgewidth=2,
-        zorder=5,
-    )
-    ax_actual.annotate(
-        f"{T_actual_max:.1f}°C @ x/b={result.peak_x_over_b:.2f}",
-        xy=(result.peak_x_over_b, T_actual_max),
-        xytext=(8, 6),
-        textcoords="offset points",
-        color=INK_PRIMARY,
-        fontsize=10,
-    )
-    ax_actual.set_xlim(result.x_over_b.min(), result.x_over_b.max())
-    y_lo = min(20.0, result.T_actual_C.min()) * 0.95
-    ax_actual.set_ylim(y_lo, T_actual_max * 1.15)
-
-    return fig_norm, fig_actual
+def _plot_convergence(r):
+    fig, ax = _axes("Flash temperature convergence", "Iteration", "ΔT_flash (K)")
+    it = np.arange(len(r.history))  # 0 = initial guess
+    ax.plot(it, r.history, "o-", color=BLUE, linewidth=1.5, markersize=4)
+    ax.axhline(r.T_flash, color=INK_MUTED, linestyle="--", linewidth=1)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    return fig
 
 
-def _significant_extent(result2d, frac=0.02, x_pad=0.3, z_pad=1.3, x_min_width=1.0, z_min=0.15):
-    """Bounding box around the part of the temperature field that's
-    actually above ambient, so the plotted axes crop to where the
-    gradient lives instead of mostly-white far-field space. `frac` is
-    the fraction of the peak temperature rise used as the "still
-    visible" cutoff. Falls back to the full grid if nothing clears it
-    (e.g. the flash temperature barely exceeds ambient)."""
-    T_ambient = float(result2d.T_field_C.min())
-    rise = result2d.T_field_C - T_ambient
-    peak_rise = rise.max()
-    if peak_rise <= 0:
-        return result2d.x_over_b.min(), result2d.x_over_b.max(), result2d.z_over_b.max()
-
-    threshold = frac * peak_rise
-    z_mask = np.any(rise > threshold, axis=1)
-    x_mask = np.any(rise > threshold, axis=0)
-    if not z_mask.any() or not x_mask.any():
-        return result2d.x_over_b.min(), result2d.x_over_b.max(), result2d.z_over_b.max()
-
-    z_hi = max(result2d.z_over_b[z_mask].max() * z_pad, z_min)
-    z_hi = min(z_hi, result2d.z_over_b.max())
-
-    x_lo, x_hi = result2d.x_over_b[x_mask].min(), result2d.x_over_b[x_mask].max()
-    width = x_hi - x_lo
-    pad = max(width * x_pad, (x_min_width - width) / 2, 0.0)
-    x_lo = max(x_lo - pad, result2d.x_over_b.min())
-    x_hi = min(x_hi + pad, result2d.x_over_b.max())
-
-    return x_lo, x_hi, z_hi
+def _plot_surface(r, T0):
+    fig, ax = _axes("Actual surface temperature", "x / b", "Temperature (°C)")
+    ax.plot(r.x_over_b, r.T_actual_C, color=ORANGE, linewidth=2)
+    ax.plot(r.peak_x_over_b, T0 + r.T_flash, "o", color=ORANGE)
+    ax.set_xlim(r.x_over_b[0], r.x_over_b[-1])
+    return fig
 
 
-def _draw_2d(result2d, Pe):
-    x_lo, x_hi, z_hi = _significant_extent(result2d)
+def _plot_field(r2):
+    x_lo, x_hi, z_hi = _crop(r2)
+    Tc = r2.T_critical_C
+    fig, ax = _axes("Subsurface temperature with residual stress", "x / b", "z / b (depth)",
+                    figsize=(6.6, 3.6))
+    mesh = ax.pcolormesh(r2.x_over_b, r2.z_over_b, r2.T_field_C, cmap=TEMP_CMAP, shading="auto")
+    cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
+    cbar.set_label("Temperature (°C)", color=INK_SECONDARY)
+    cbar.ax.tick_params(colors=INK_MUTED)
+    cbar.outline.set_visible(False)
 
-    T_crit = result2d.T_critical_C
-    yielded = np.isfinite(T_crit) and np.any(result2d.T_flank_profile_C > T_crit)
-    if yielded:
-        # Guarantee the yielded-depth marker below is never cropped out,
-        # even in the rare case it reaches slightly past the field's own
-        # "significant gradient" cutoff.
-        yield_depth = result2d.z_over_b[result2d.T_flank_profile_C > T_crit].max()
-        z_hi = max(z_hi, yield_depth * 1.15)
-
-    fig_field, ax_field = _new_figure()
-    _style_axes(
-        ax_field,
-        f"Subsurface temperature field (flank cutaway, Pe = {Pe:.2f})",
-        "z / b (depth)",
-    )
-    ax_field.set_xlabel("x / b", color=INK_SECONDARY)
-    mesh = ax_field.pcolormesh(
-        result2d.x_over_b,
-        result2d.z_over_b,
-        result2d.T_field_C,
-        cmap=TEMP_CMAP,
-        shading="auto",
-    )
-    colorbar = fig_field.colorbar(mesh, ax=ax_field, pad=0.02)
-    colorbar.ax.tick_params(colors=INK_MUTED)
-    colorbar.set_label("Temperature (°C)", color=INK_SECONDARY)
-    colorbar.outline.set_visible(False)
-
-    field_max = result2d.T_field_C.max()
-    if np.isfinite(T_crit) and field_max > T_crit > result2d.T_field_C.min():
-        ax_field.contour(
-            result2d.x_over_b,
-            result2d.z_over_b,
-            result2d.T_field_C,
-            levels=[T_crit],
-            colors=[INK_PRIMARY],
-            linewidths=1.0,
-            linestyles="dashed",
-        )
-    ax_field.axvline(
-        result2d.flank_x_over_b, color=INK_PRIMARY, linewidth=1.0, linestyle=":"
-    )
-    ax_field.set_xlim(x_lo, x_hi)
-    ax_field.set_ylim(z_hi, 0)  # surface (z=0) at top, like a cutaway; cropped to the gradient
-
-    fig_rs, ax_rs = _new_figure()
-    _style_axes(
-        ax_rs, "Residual stress near flank (x/b ≈ 1)", "Residual stress (MPa)"
-    )
-    ax_rs.set_xlabel("z / b (depth)", color=INK_SECONDARY)
-    ax_rs.axhline(0.0, color=AXIS_COLOR, linewidth=1.0)
-    rs = result2d.residual_stress_MPa
-    ax_rs.plot(result2d.z_over_b, rs, color=SERIES_ACTUAL, linewidth=2)
-    # Share the field plot's depth crop so both panels read at the same scale.
-    ax_rs.set_xlim(0.0, z_hi)
-    rs_max = max(rs.max(), 0.0)
-    rs_min = min(rs.min(), 0.0)
-    pad = max(rs_max - rs_min, 1.0) * 0.15
-    ax_rs.set_ylim(rs_min - pad, rs_max + pad)
-
-    if yielded:
-        ax_rs.axvline(yield_depth, color=INK_MUTED, linewidth=1.0, linestyle="--")
-        ax_rs.annotate(
-            f"yielded to z/b={yield_depth:.2f}",
-            xy=(yield_depth, rs_max + pad * 0.5),
-            xytext=(6, 6),
-            textcoords="offset points",
-            color=INK_MUTED,
-            fontsize=8,
-        )
-
-    return fig_field, fig_rs
+    rs = residual_stress(r2.T_field_C, Tc)
+    if rs.max() > 0:
+        # Yield boundary (T = T_crit), then one coloured contour per RS level.
+        ax.contour(r2.x_over_b, r2.z_over_b, r2.T_field_C, levels=[Tc],
+                   colors=[INK_PRIMARY], linewidths=1.2, linestyles="dashed")
+        ax.plot([], [], "--", color=INK_PRIMARY, linewidth=1.2, label=f"T = T_crit ({Tc:.0f} °C)")
+        levels = MaxNLocator(4).tick_values(0, rs.max())[1:-1]
+        for color, level in zip(RS_COLORS, levels):
+            ax.contour(r2.x_over_b, r2.z_over_b, rs, levels=[level], colors=[color], linewidths=1.3)
+            ax.plot([], [], color=color, linewidth=1.3, label=f"RS = {level:.0f} MPa")
+    else:
+        ax.set_title("Subsurface temperature (no yielding, RS = 0)",
+                     color=INK_PRIMARY, fontsize=11, loc="left")
+    ax.axvline(r2.flank_x_over_b, color=INK_MUTED, linewidth=1, linestyle=":")
+    ax.plot([], [], ":", color=INK_MUTED, label="Flank x/b = 1")
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.3, 1.0),
+              labelcolor=INK_SECONDARY)
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(z_hi, 0)  # surface at top
+    return fig
 
 
-FEED_COLORS = ["#2a78d6", "#eb6834", "#1a9850", "#8e44ad", "#c0392b", "#7f8c8d"]
+def _plot_rs(r2):
+    fig, ax = _axes("Residual stress at flank (x/b = 1)", "z / b (depth)", "Residual stress (MPa)")
+    ax.axhline(0.0, color=AXIS_COLOR, linewidth=1)
+    ax.plot(r2.z_over_b, r2.residual_stress_MPa, color=ORANGE, linewidth=2)
+    yielded = r2.z_over_b[r2.residual_stress_MPa > 0]
+    ax.set_xlim(0, 1.5 * yielded.max() if yielded.size else _crop(r2)[2])
+    return fig
 
 
-def _draw_machining(w, b, feeds):
-    """Assignment plots: force vs feed, flash T vs speed (one line per feed),
-    and critical speed vs feed with a power-law fit. Ti-6Al-4V only."""
+@st.cache_data(show_spinner=False)
+def _critical_speed(h, w, b, T0):
+    return critical_speed(h, w, b, T0)
+
+
+@st.cache_data(show_spinner="Computing machining sweeps…")
+def _machining(w, b, T0):
     h = np.linspace(0.01, 0.10, 50)
-    fig_f, ax = _new_figure()
-    _style_axes(ax, f"Cutting force vs feed (w = {w:g} mm)", "Cutting force Fc (N)")
-    ax.set_xlabel("Feed / uncut chip thickness h (mm)", color=INK_SECONDARY)
-    ax.plot(h, force_vs_feed(h, w), color=SERIES_NORM, linewidth=2)
-
     v = np.geomspace(0.1, 10.0, 40)
-    fig_t, ax = _new_figure()
-    _style_axes(ax, f"Flash temperature vs cutting speed (b = {b:g} µm)", "Peak temperature (°C)")
-    ax.set_xlabel("Cutting speed (m/s)", color=INK_SECONDARY)
+    T_lines = [flash_vs_speed(v, hf, w, b, T0) for hf in SWEEP_FEEDS]
+    hc = np.linspace(0.01, 0.10, 19)
+    vc = np.array([critical_speed(x, w, b, T0) for x in hc])
+    return h, force_vs_feed(h, w), v, T_lines, hc, vc
+
+
+def _plot_machining(w, b, T0):
+    h, F, v, T_lines, hc, vc = _machining(w, b, T0)
+
+    fig_f, ax = _axes(f"Cutting force vs feed (w = {w:g} mm)", "Feed h (mm)", "Cutting force Fc (N)")
+    ax.plot(h, F, color=BLUE, linewidth=2)
+
+    fig_t, ax = _axes("Peak temperature vs cutting speed", "Cutting speed (m/s)", "Peak temperature (°C)")
     ax.set_xscale("log")
-    for color, hf in zip(FEED_COLORS, feeds):
-        ax.plot(v, flash_vs_speed(v, hf, w, b), color=color, linewidth=2, label=f"h = {hf:g} mm")
+    for color, hf, T in zip(FEED_COLORS, SWEEP_FEEDS, T_lines):
+        ax.plot(v, T, color=color, linewidth=2, label=f"h = {hf:g} mm")
     ax.legend(frameon=False)
 
-    hc = np.linspace(0.02, 0.10, 17)
-    vc = np.array([critical_speed(x, w, b) for x in hc])
-    a, n = critical_speed_fit(hc, vc)
-    fig_c, ax = _new_figure()
-    _style_axes(ax, "Critical speed for surface tensile stress", "Critical cutting speed (m/s)")
-    ax.set_xlabel("Feed h (mm)", color=INK_SECONDARY)
-    ax.plot(hc, vc, "o", color=SERIES_ACTUAL, label="model")
-    ax.plot(hc, a * hc**n, color=INK_MUTED, linestyle="--", label=f"fit: v = {a:.4g}·h^{n:.3f}")
+    fig_c, ax = _axes("Critical speed for tensile surface RS", "Feed h (mm)", "Critical speed (m/s)")
+    ok = np.isfinite(vc)
+    fit = None
+    if ok.sum() >= 2:
+        a, n = critical_speed_fit(hc, vc)
+        fit = (a, n)
+        ax.plot(hc[ok], a * hc[ok] ** n, color=INK_MUTED, linestyle="--",
+                label=f"v = {a:.3g}·h^{n:.3f}")
+    ax.plot(hc[ok], vc[ok], "o", color=ORANGE, label="model")
     ax.legend(frameon=False)
-    return fig_f, fig_t, fig_c, a, n
+    return (fig_f, fig_t, fig_c), fit
 
 
+# ---------------------------------------------------------------------- page
 def main():
-    st.set_page_config(page_title="Cutting Thermal Model", layout="wide")
-    _init_state()
-    _build_sidebar()
+    st.set_page_config(page_title="Ti-6Al-4V Cutting Thermal Model", layout="wide")
+    v, h, b, w, T0 = _inputs()
+    Fc = float(kienzle_force(h, w))
+    r = solve(v, Fc, w, b, T0)
+    r2 = solve_2d(v, Fc, w, b, T0, x_over_b=X_OVER_B, z_over_b=Z_OVER_B)
+    figs, fit = _plot_machining(w, b, T0)
+    v_crit = _critical_speed(h, w, b, T0)
 
-    material = st.session_state["material"]
-    Fc_N = _effective_force(material)
-    v, w, b = (st.session_state[k] for k in ("v_m_min", "w_mm", "b_um"))
-    result = solve(material, v, Fc_N, w, b)
+    st.title("Ti-6Al-4V Cutting Thermal Model")
+    if not r.converged:
+        st.error(f"Flash temperature did not converge in {r.iterations} iterations.")
 
-    st.title("Cutting Thermal Model")
-    st.caption(
-        f"{material} | Fc = {Fc_N:.1f} N | v = {v:g} m/min | "
-        f"b = {b:g} µm | w = {w:g} mm | T₀ = 20 °C"
-    )
-    if not result.converged:
-        st.error("Solver: not converged")
+    m = st.columns(6)
+    m[0].metric("Peak surface T", f"{T0 + r.T_flash:.1f} °C")
+    m[1].metric("Flash rise ΔT", f"{r.T_flash:.1f} K")
+    m[2].metric("Peclet number", f"{r.Pe:.3f}")
+    m[3].metric("Critical T (yield)", f"{r2.T_critical_C:.1f} °C")
+    m[4].metric("Surface RS at flank", f"{r2.residual_stress_MPa[0]:.1f} MPa")
+    yielded = r2.z_over_b[r2.residual_stress_MPa > 0]
+    m[5].metric("Yielded depth", f"{yielded.max() * b:.1f} µm" if yielded.size else "0 µm")
+    _values_row([
+        ("Cutting force Fc (Kienzle)", f"{Fc:.1f} N"),
+        ("Contact length 2b", f"{2 * b:g} µm"),
+        ("Density ρ", f"{TI64['rho']:g} kg/m³"),
+        ("k at convergence", f"{r.k:.2f} W/(m·K)"),
+        ("cp at convergence", f"{r.cp:.1f} J/(kg·K)"),
+        ("Initial guess (T₀ + T_melt)/2", f"{r.history[0]:.0f} °C"),
+        ("Iterations", f"{r.iterations}"),
+        ("Critical speed at this h", f"{v_crit:.3f} m/s" if np.isfinite(v_crit) else "> 10 m/s"),
+        ("Critical speed fit", f"v = {fit[0]:.4g}·h^{fit[1]:.3f}" if fit else "n/a"),
+    ])
 
-    tab_overview, tab_1d, tab_2d, tab_mach = st.tabs(
-        ["Overview", "1D view", "2D view", "Machining (Ti-6Al-4V)"])
-    result2d = solve_2d(material, v, Fc_N, w, b, x_over_b=APP_X_OVER_B, z_over_b=APP_Z_OVER_B)
+    st.subheader("Surface (1D)")
+    c = st.columns(3)
+    _show(c[0], _plot_shape(r))
+    _show(c[1], _plot_convergence(r))
+    _show(c[2], _plot_surface(r, T0))
 
-    with tab_overview:
-        metrics = st.columns(4)
-        metrics[0].metric("Peak surface temperature", f"{20 + result.T_flash:.1f} °C")
-        metrics[1].metric("Flash temperature rise ΔT", f"{result.T_flash:.1f} K")
-        metrics[2].metric("Peclet number", f"{result.Pe:.3f}")
-        metrics[3].metric("Thermal-yield threshold", f"{result2d.T_critical_C:.1f} °C")
-        st.caption(
-            f"ρ = {MATERIALS[material]['rho']:g} kg/m³; "
-            f"k = {result.k:.2f} W/(m·K); cp = {result.cp:.2f} J/(kg·K) "
-            f"| Solver: {'converged' if result.converged else 'NOT converged'} "
-            f"| Iterations = {result.iterations}"
-        )
-        columns = st.columns(3)
-        norm, surface = _draw_1d(result)
-        plt.close(norm)
-        field, stress = _draw_2d(result2d, result2d.Pe)
-        for column, title, fig in zip(columns,
-                ["Surface temperature", "Subsurface temperature", "Residual stress"],
-                [surface, field, stress]):
-            column.markdown(f"**{title}**")
-            fig.tight_layout()
-            column.pyplot(fig)
-            plt.close(fig)
-        # Report an actual subsurface sample, separately from the surface maximum.
-        depth_idx = 1
-        st.caption(
-            f"x/b = {result2d.flank_x_over_b:.3f} | "
-            f"z/b = {result2d.z_over_b[depth_idx]:.3f} "
-            f"(z = {result2d.z_over_b[depth_idx] * b:.2f} µm): "
-            f"T = {result2d.T_flank_profile_C[depth_idx]:.1f} °C, "
-            f"σres = {result2d.residual_stress_MPa[depth_idx]:.1f} MPa. "
-            "Tensile +"
-        )
+    st.subheader("Subsurface (2D)")
+    c = st.columns([1.3, 1])
+    _show(c[0], _plot_field(r2))
+    _show(c[1], _plot_rs(r2))
 
-    with tab_1d:
-        fig_norm, fig_actual = _draw_1d(result)
-        col1, col2 = st.columns(2)
-        col1.pyplot(fig_norm, clear_figure=True)
-        col2.pyplot(fig_actual, clear_figure=True)
-
-    with tab_mach:
-        feeds = st.multiselect("Feeds for flash-temperature lines (mm)",
-                               [0.01, 0.02, 0.03, 0.05, 0.07, 0.10],
-                               default=[0.01, 0.05, 0.10])
-        st.caption("Force from the Ti-6Al-4V Kienzle fit; uses the sidebar width of cut w and "
-                   "contact half-width b. Critical speed = lowest speed at which the flank "
-                   "(x/b = 1) surface temperature exceeds the thermal-yield temperature.")
-        fig_f, fig_t, fig_c, a, n = _draw_machining(
-            st.session_state["w_mm"], st.session_state["b_um"], feeds)
-        c1, c2, c3 = st.columns(3)
-        for col, fig in zip((c1, c2, c3), (fig_f, fig_t, fig_c)):
-            fig.tight_layout()
-            col.pyplot(fig, clear_figure=True)
-        st.markdown(f"**Critical speed fit:** v_crit ≈ {a:.4g} · h^{n:.3f} "
-                    "(v in m/s, h in mm; h = 0.01 mm never reaches it below 10 m/s)")
-
-    with tab_2d:
-        st.caption(
-            f"T_critical = {result2d.T_critical_C:.1f} °C | "
-            f"σres = {result2d.residual_stress_MPa.min():.1f} to "
-            f"{result2d.residual_stress_MPa.max():.1f} MPa | "
-            f"x/b = {result2d.flank_x_over_b:.3f}"
-        )
-
-        fig_field, fig_rs = _draw_2d(result2d, result2d.Pe)
-        col1, col2 = st.columns(2)
-        col1.pyplot(fig_field, clear_figure=True)
-        col2.pyplot(fig_rs, clear_figure=True)
+    st.subheader("Machining sweeps")
+    c = st.columns(3)
+    for col, fig in zip(c, figs):
+        _show(col, fig)
 
 
 if __name__ == "__main__":
